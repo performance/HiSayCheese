@@ -15,8 +15,7 @@ import { suggestEnhancements, SuggestEnhancementsOutput } from '@/ai/flows/sugge
 import { generateEnhancementJourney, GenerateEnhancementJourneyOutput } from '@/ai/flows/virtual-enhancement-journey';
 import { assessImageQuality, ImageQualityAssessmentOutput } from '@/ai/flows/image-quality-assessment';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { Progress } from '@/components/ui/progress'; // Import Progress
-import { Skeleton } from '@/components/ui/skeleton'; // Import Skeleton
+import { Skeleton } from '@/components/ui/skeleton';
 
 // --- Enhancement Controls Type ---
 interface EnhancementValues {
@@ -67,6 +66,8 @@ export default function HeadshotApp() {
     setEnhancementJourney(null);
     setSuggestionRationale(null);
     setImageQualityAssessment(null); // Reset assessment
+    setEnhancementValues(initialEnhancements);
+
 
     toast({
       title: "Image Uploaded",
@@ -216,15 +217,18 @@ export default function HeadshotApp() {
     }
     setIsLoadingAI(true);
     setShowBeforeAfter(false);
-    setUploadedImageIsAiEnhanced(false);
+    // setUploadedImageIsAiEnhanced(false); // Don't reset this, as we are not applying yet
     setEnhancementJourney(null);
     setSuggestionRationale(null);
+    // Don't revert to original image visually, let user see current state while suggestions load
+    // setUploadedImage(originalImage); 
 
     try {
       const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: originalImage });
       const animationDurationPerSlider = 400;
       setSuggestionRationale(suggestions.rationale);
 
+      // Animate sliders to suggested values but don't "apply" them to the image yet
       await animateSlider('brightness', suggestions.brightness, animationDurationPerSlider);
       await animateSlider('contrast', suggestions.contrast, animationDurationPerSlider);
       await animateSlider('saturation', suggestions.saturation, animationDurationPerSlider);
@@ -232,8 +236,8 @@ export default function HeadshotApp() {
       await animateSlider('faceSmoothing', suggestions.faceSmoothing, animationDurationPerSlider);
 
       toast({
-        title: "AI Suggestions Applied",
-        description: "Sliders animated to suggested values. Hover over (i) for rationale.",
+        title: "AI Suggestions Loaded",
+        description: "Sliders animated to suggested values. Hover over (i) for rationale. Click 'Apply AI' to see changes.",
       });
     } catch (error) {
       console.error("Error suggesting enhancements:", error);
@@ -259,17 +263,32 @@ export default function HeadshotApp() {
      }
      setIsProcessingEnhancement(true);
      setEnhancementJourney(null);
-     setShowBeforeAfter(false);
+     setShowBeforeAfter(false); // Start by showing the enhanced image
+
+     if(imageContainerRef.current) {
+       imageContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+     }
+    
+    // First, animate sliders one by one. The image itself will be updated at the end.
+    const animationDurationPerSlider = 300; // Shorter duration for visual effect
+    const currentSettings = {...enhancementValues}; // Capture current settings for AI
+
+    // Simulate animating each slider to its current value if not already there (this is more for show)
+    await animateSlider('brightness', currentSettings.brightness, animationDurationPerSlider);
+    await animateSlider('contrast', currentSettings.contrast, animationDurationPerSlider);
+    await animateSlider('saturation', currentSettings.saturation, animationDurationPerSlider);
+    await animateSlider('backgroundBlur', currentSettings.backgroundBlur, animationDurationPerSlider);
+    await animateSlider('faceSmoothing', currentSettings.faceSmoothing, animationDurationPerSlider);
+
 
      try {
        const journeyResult = await generateEnhancementJourney({
-         photoDataUri: originalImage,
-         ...enhancementValues,
+         photoDataUri: originalImage, // Always enhance from the original
+         ...currentSettings, // Use the slider values that were just "animated"
        });
        setUploadedImage(journeyResult.enhancedPhotoDataUri);
        setEnhancementJourney(journeyResult);
-       setUploadedImageIsAiEnhanced(true);
-       setShowBeforeAfter(false);
+       setUploadedImageIsAiEnhanced(true); // Mark that the current view is AI enhanced
        toast({
          title: "Enhancement Applied",
          description: "Image enhanced by AI using current settings. See journey steps.",
@@ -281,6 +300,7 @@ export default function HeadshotApp() {
          description: `Could not apply AI enhancements. ${error instanceof Error ? error.message : ''}`,
          variant: "destructive",
        });
+       setUploadedImage(originalImage); // Revert to original on error
        setUploadedImageIsAiEnhanced(false);
      } finally {
        setIsProcessingEnhancement(false);
@@ -288,14 +308,18 @@ export default function HeadshotApp() {
    };
 
    const toggleBeforeAfter = () => {
-      if (!originalImage || !uploadedImage) return;
-     if (showBeforeAfter || !uploadedImageIsAiEnhanced) {
+      if (!originalImage || !uploadedImage) return; // Needs original and *some* uploaded image
+     
+      if (showBeforeAfter) { // If currently showing original, switch to enhanced
+        setUploadedImage(enhancementJourney?.enhancedPhotoDataUri || originalImage); // Use AI enhanced if available
         setShowBeforeAfter(false);
-     } else {
+      } else { // If currently showing enhanced (or initial upload), switch to original
+        // No need to change uploadedImage here, just toggle the flag
         setShowBeforeAfter(true);
-     }
+      }
    }
-
+  
+   // Image style is only for client-side preview when NOT AI enhanced and NOT showing "before"
    const getImageStyle = (): React.CSSProperties => {
      if (showBeforeAfter || uploadedImageIsAiEnhanced) return {};
      return {
@@ -305,8 +329,10 @@ export default function HeadshotApp() {
          saturate(${1 + (enhancementValues.saturation - 0.5) * 1})
          blur(${(enhancementValues.backgroundBlur * 5)}px)
        `,
+       // Note: Face smoothing cannot be easily previewed with CSS filters
      };
    };
+
 
    const RationaleTooltip = ({ rationale }: { rationale: string | undefined }) => {
      if (!rationale) return null;
@@ -326,22 +352,21 @@ export default function HeadshotApp() {
      );
    };
 
-  const ScoreBar = ({ label, score, icon: Icon, lowIsGood = false }: { label: string, score: number, icon?: React.ElementType, lowIsGood?: boolean }) => {
-    const percentage = score * 10; // Assuming score is 0-10
-    let colorClass = 'bg-green-500';
-    if ((!lowIsGood && percentage < 40) || (lowIsGood && percentage >= 70)) colorClass = 'bg-red-500';
-    else if ((!lowIsGood && percentage < 70) || (lowIsGood && percentage >= 40)) colorClass = 'bg-yellow-500';
+  const ScoreDisplay = ({ label, score, icon: Icon, lowIsGood = false, outOf = 10 }: { label: string, score: number, icon?: React.ElementType, lowIsGood?: boolean, outOf?:number }) => {
+    const displayScore = outOf === 10 ? `${score}/${outOf}` : `${(score * 100 / outOf).toFixed(0)}%`;
+    let scoreColorClass = 'text-primary'; // Default
+    const percentage = score * (100 / outOf);
 
+    if ((!lowIsGood && percentage < 40) || (lowIsGood && percentage >= 70)) scoreColorClass = 'text-destructive';
+    else if ((!lowIsGood && percentage < 70) || (lowIsGood && percentage >= 40)) scoreColorClass = 'text-yellow-500'; // You might need to define this color in globals.css or use a Tailwind class like text-yellow-500
+    
     return (
-      <div className="space-y-1">
-        <div className="flex items-center justify-between text-sm">
-          <span className="font-medium flex items-center">
-            {Icon && <Icon className="w-4 h-4 mr-2 text-muted-foreground" />}
-            {label}
-          </span>
-          <span className="font-semibold text-primary">{score}/10</span>
-        </div>
-        <Progress value={percentage} className={`h-2 ${colorClass}`} />
+      <div className="flex items-center justify-between text-sm py-1">
+        <span className="font-medium flex items-center">
+          {Icon && <Icon className={`w-4 h-4 mr-2 ${lowIsGood && score > (outOf * 0.6) ? 'text-destructive' : (score < (outOf * 0.4) && !lowIsGood ? 'text-destructive' : 'text-muted-foreground')}`} />}
+          {label}
+        </span>
+        <span className={`font-semibold ${scoreColorClass}`}>{displayScore}</span>
       </div>
     );
   };
@@ -384,10 +409,10 @@ export default function HeadshotApp() {
         </div>
       </header>
 
-      <main className="flex-grow container mx-auto px-4 py-8 flex flex-col lg:flex-row gap-8 overflow-hidden">
+      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]"> {/* 8rem for header and footer approx */}
         <div
             ref={imageContainerRef}
-            className="flex-grow lg:w-2/3 h-full flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden"
+            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full" // Ensure image container takes available height
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -449,44 +474,32 @@ export default function HeadshotApp() {
           )}
         </div>
 
-        <div className="lg:w-1/3 flex flex-col gap-4 overflow-y-auto pr-2">
+        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full"> {/* Allow this column to scroll */}
           {/* Image Quality Assessment Panel */}
           <Card className="flex-shrink-0">
-            <CardHeader><CardTitle>Image Quality Assessment</CardTitle></CardHeader>
-            <CardContent className="space-y-4">
+            <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
+            <CardContent className="space-y-2">
               {isAssessingQuality && !imageQualityAssessment && (
                 <>
-                  <Skeleton className="h-8 w-3/4" />
-                  <Skeleton className="h-2 w-full" />
-                  <Skeleton className="h-8 w-3/4 mt-2" />
-                  <Skeleton className="h-2 w-full" />
-                  <Skeleton className="h-8 w-3/4 mt-2" />
-                  <Skeleton className="h-2 w-full" />
-                  <Skeleton className="h-8 w-3/4 mt-2" />
-                  <Skeleton className="h-2 w-full" />
+                  <Skeleton className="h-6 w-3/4" />
+                  <Skeleton className="h-6 w-full" />
+                  <Skeleton className="h-6 w-3/4 mt-1" />
+                  <Skeleton className="h-6 w-full mt-1" />
+                  <Skeleton className="h-6 w-3/4 mt-1" />
+                  <Skeleton className="h-6 w-full mt-1" />
                   <Skeleton className="h-6 w-1/2 mt-2" />
-                  <Skeleton className="h-4 w-full mt-1" />
                   <Skeleton className="h-4 w-full mt-1" />
                 </>
               )}
               {!isAssessingQuality && !uploadedImage && (
-                <p className="text-sm text-muted-foreground">Upload an image to see its quality assessment.</p>
+                <p className="text-sm text-muted-foreground">Upload an image for quality assessment.</p>
               )}
               {imageQualityAssessment && (
                 <>
-                  <ScoreBar label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
-                  <ScoreBar label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
-                  <ScoreBar label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
-                   <div className="space-y-1">
-                      <div className="flex items-center justify-between text-sm">
-                           <span className="font-medium flex items-center">
-                            <CheckCircle2 className="w-4 h-4 mr-2 text-muted-foreground" />
-                            Overall Suitability
-                           </span>
-                           <span className="font-semibold text-primary">{imageQualityAssessment.overallSuitabilityScore}/10</span>
-                         </div>
-                         <Progress value={imageQualityAssessment.overallSuitabilityScore * 10} className="h-2 bg-primary/20 [&>div]:bg-primary" />
-                    </div>
+                  <ScoreDisplay label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
+                  <ScoreDisplay label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
+                  <ScoreDisplay label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
+                  <ScoreDisplay label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
 
                   {imageQualityAssessment.feedback.length > 0 && (
                     <div>
@@ -505,13 +518,13 @@ export default function HeadshotApp() {
 
           <Card className="flex-shrink-0">
             <CardHeader>
-              <CardTitle>Enhancement Controls</CardTitle>
+              <CardTitle className="text-xl">Enhancement Controls</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="space-y-4">
               {(Object.keys(initialEnhancements) as Array<keyof EnhancementValues>).map((key) => (
                 <div key={key} className="space-y-2">
                   <div className="flex justify-between items-center">
-                     <Label htmlFor={key} className="capitalize font-medium flex items-center">
+                     <Label htmlFor={key} className="capitalize font-medium flex items-center text-sm">
                        {key.replace(/([A-Z])/g, ' $1').replace('Background B', 'Bg B')}
                        <RationaleTooltip rationale={suggestionRationale?.[key]} />
                      </Label>
@@ -526,18 +539,18 @@ export default function HeadshotApp() {
                     onValueChange={(val) => handleSliderChange(key, val)}
                     disabled={!uploadedImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
                     aria-label={`${key} slider`}
-                    className="[&>span:last-child]:transition-transform [&>span:last-child]:duration-100 [&>span:last-child]:ease-linear"
+                    className="[&>span:last-child]:transition-transform [&>span:last-child]:duration-100 [&>span:last-child]:ease-linear h-2"
                   />
                 </div>
               ))}
             </CardContent>
-             <CardFooter className="flex flex-col gap-4 pt-4">
+             <CardFooter className="flex flex-col gap-3 pt-4">
                 <Button
                    onClick={handleSuggestEnhancements}
                    disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
                    className="w-full"
                  >
-                   <WandSparkles className="mr-2" /> Suggest & Animate (AI)
+                   <WandSparkles className="mr-2 h-4 w-4" /> Suggest & Animate (AI)
                    {isLoadingAI && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-foreground ml-2"></div>}
                  </Button>
                  <Button
@@ -553,7 +566,7 @@ export default function HeadshotApp() {
 
            {enhancementJourney && !isProcessingEnhancement && (
               <Card className="flex-shrink-0">
-                 <CardHeader><CardTitle>Enhancement Journey Steps</CardTitle></CardHeader>
+                 <CardHeader><CardTitle className="text-xl">Enhancement Journey</CardTitle></CardHeader>
                  <CardContent>
                    <ul className="list-decimal pl-5 space-y-2 text-sm">
                      {enhancementJourney.enhancementSteps.length > 0 ? (
@@ -572,7 +585,7 @@ export default function HeadshotApp() {
       </main>
 
       <footer className="bg-card border-t mt-auto flex-shrink-0">
-        <div className="container mx-auto px-4 py-4 text-center text-muted-foreground text-sm">
+        <div className="container mx-auto px-4 py-3 text-center text-muted-foreground text-xs">
           &copy; {new Date().getFullYear()} Headshot Handcrafter. All rights reserved.
         </div>
       </footer>

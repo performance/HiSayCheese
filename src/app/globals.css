@@ -98,6 +98,9 @@ body {
   .bg-yellow-500 {
     background-color: #eab308; /* Tailwind yellow-500 */
   }
+  .text-yellow-500 { /* Added this utility class */
+    color: #eab308; /* Tailwind yellow-500 */
+  }
   .bg-red-500 {
     background-color: #ef4444; /* Tailwind red-500 */
   }

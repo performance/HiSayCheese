@@ -1,3 +1,4 @@
+
 'use client';
 
 import type { ChangeEvent } from 'react';
@@ -11,7 +12,7 @@ import { Upload, Camera, WandSparkles, CheckSquare, Linkedin, Users } from 'luci
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useToast } from '@/hooks/use-toast';
 import { suggestEnhancements, SuggestEnhancementsOutput } from '@/ai/flows/suggest-enhancements';
-// import { generateEnhancementJourney, GenerateEnhancementJourneyOutput } from '@/ai/flows/virtual-enhancement-journey'; // Import AI flow
+import { generateEnhancementJourney, GenerateEnhancementJourneyOutput } from '@/ai/flows/virtual-enhancement-journey'; // Import AI flow
 
 
 // --- Enhancement Controls Type ---
@@ -41,10 +42,12 @@ export default function HeadshotApp() {
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [isProcessingEnhancement, setIsProcessingEnhancement] = useState(false);
   const [showBeforeAfter, setShowBeforeAfter] = useState(false); // State for before/after view
-  // const [enhancementJourney, setEnhancementJourney] = useState<GenerateEnhancementJourneyOutput | null>(null);
+  const [enhancementJourney, setEnhancementJourney] = useState<GenerateEnhancementJourneyOutput | null>(null);
+  const [uploadedImageIsAiEnhanced, setUploadedImageIsAiEnhanced] = useState(false); // Track if current view is AI enhanced
 
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageContainerRef = useRef<HTMLDivElement>(null); // Ref for image container card
   const { toast } = useToast();
 
   const handleImageUpload = (event: ChangeEvent<HTMLInputElement>) => {
@@ -66,6 +69,8 @@ export default function HeadshotApp() {
         setUploadedImage(dataUri);
         setOriginalImage(dataUri); // Store original on upload
         setShowBeforeAfter(false); // Reset view on new image
+        setUploadedImageIsAiEnhanced(false); // Reset AI enhancement flag
+        setEnhancementJourney(null); // Reset journey steps
         // Reset enhancements or keep them based on desired UX
         // setEnhancementValues(initialEnhancements);
          toast({
@@ -109,6 +114,8 @@ export default function HeadshotApp() {
          setUploadedImage(dataUri);
          setOriginalImage(dataUri);
          setShowBeforeAfter(false);
+         setUploadedImageIsAiEnhanced(false); // Reset AI enhancement flag
+         setEnhancementJourney(null); // Reset journey steps
          toast({
            title: "Image Uploaded",
            description: "Ready for enhancement.",
@@ -151,12 +158,37 @@ export default function HeadshotApp() {
 
   const handleSliderChange = (key: keyof EnhancementValues, value: number[]) => {
     setEnhancementValues((prev) => ({ ...prev, [key]: value[0] }));
-    // Apply real-time visual update (can be complex, start with simple CSS filters)
-    // For now, state update is sufficient, actual image processing happens on 'Apply' or auto
+    // Live preview is handled by CSS filters now
   };
 
+  const animateSlider = (key: keyof EnhancementValues, targetValue: number, duration: number = 500) => {
+    return new Promise<void>((resolve) => {
+      const startValue = enhancementValues[key];
+      const startTime = performance.now();
+
+      const step = (currentTime: number) => {
+        const elapsedTime = currentTime - startTime;
+        const progress = Math.min(elapsedTime / duration, 1);
+        const currentValue = startValue + (targetValue - startValue) * progress;
+
+        setEnhancementValues((prev) => ({ ...prev, [key]: currentValue }));
+
+        if (progress < 1) {
+          requestAnimationFrame(step);
+        } else {
+          // Ensure final value is set precisely
+          setEnhancementValues((prev) => ({ ...prev, [key]: targetValue }));
+          resolve();
+        }
+      };
+
+      requestAnimationFrame(step);
+    });
+  };
+
+
   const handleSuggestEnhancements = async () => {
-    if (!uploadedImage) {
+    if (!originalImage) { // Use original image for suggestions
       toast({
         title: "No Image",
         description: "Please upload an image first.",
@@ -165,15 +197,28 @@ export default function HeadshotApp() {
       return;
     }
     setIsLoadingAI(true);
+    setShowBeforeAfter(false); // Ensure enhanced view is active
+    setUploadedImageIsAiEnhanced(false); // Suggestions don't mean AI enhanced final image yet
+
+    // Scroll image into view before starting animation
+    imageContainerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // Add a small delay to allow scrolling to start/complete
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+
     try {
-      const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: uploadedImage });
-      setEnhancementValues({
-        brightness: suggestions.brightness,
-        contrast: suggestions.contrast,
-        saturation: suggestions.saturation,
-        backgroundBlur: suggestions.backgroundBlur,
-        faceSmoothing: suggestions.faceSmoothing,
-      });
+      const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: originalImage });
+
+      const animationDurationPerSlider = 400; // ms
+
+      // Animate sliders one by one
+      await animateSlider('brightness', suggestions.brightness, animationDurationPerSlider);
+      await animateSlider('contrast', suggestions.contrast, animationDurationPerSlider);
+      await animateSlider('saturation', suggestions.saturation, animationDurationPerSlider);
+      await animateSlider('backgroundBlur', suggestions.backgroundBlur, animationDurationPerSlider);
+      await animateSlider('faceSmoothing', suggestions.faceSmoothing, animationDurationPerSlider);
+
+
       toast({
         title: "AI Suggestions Applied",
         description: "Enhancement sliders updated with AI recommendations.",
@@ -185,13 +230,15 @@ export default function HeadshotApp() {
         description: "Could not get AI enhancement suggestions. Please try again.",
         variant: "destructive",
       });
+       // Reset sliders if AI fails
+      setEnhancementValues(initialEnhancements);
     } finally {
       setIsLoadingAI(false);
     }
   };
 
   const handleApplyEnhancements = async () => {
-     if (!uploadedImage || !originalImage) {
+     if (!originalImage) { // Ensure original image exists
        toast({
          title: "No Image",
          description: "Please upload an image first.",
@@ -200,83 +247,83 @@ export default function HeadshotApp() {
        return;
      }
      setIsProcessingEnhancement(true);
-     // setEnhancementJourney(null); // Reset journey
+     setEnhancementJourney(null); // Reset journey
+     setShowBeforeAfter(false); // Ensure enhanced view is active
 
-     // TODO: Integrate the actual generateEnhancementJourney AI flow
-     // This section is commented out as it requires the AI flow to be fully functional and integrated.
-     /*
+     // Scroll image into view before starting AI processing
+     imageContainerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Add a small delay
+     await new Promise(resolve => setTimeout(resolve, 300));
+
+
      try {
        const journeyResult = await generateEnhancementJourney({
          photoDataUri: originalImage, // Send original image for enhancement
-         ...enhancementValues,
+         ...enhancementValues, // Send current slider values
        });
-       setUploadedImage(journeyResult.enhancedPhotoDataUri); // Update image with enhanced version
+       setUploadedImage(journeyResult.enhancedPhotoDataUri); // Update image with AI-enhanced version
        setEnhancementJourney(journeyResult); // Store the journey steps
-       setShowBeforeAfter(true); // Show the before/after view
+       setUploadedImageIsAiEnhanced(true); // Mark that the image is now AI-enhanced
+       setShowBeforeAfter(false); // Ensure the 'enhanced' view shows the new AI image
        toast({
          title: "Enhancement Applied",
-         description: "Image enhanced successfully. See the visual journey!",
+         description: "Image enhanced by AI. See the visual journey steps below!",
        });
      } catch (error) {
        console.error("Error applying enhancement journey:", error);
        toast({
          title: "Enhancement Error",
-         description: "Could not apply enhancements. Please try again.",
+         description: "Could not apply AI enhancements. Please try again.",
          variant: "destructive",
        });
+       setUploadedImage(originalImage); // Revert to original image on error
+       setUploadedImageIsAiEnhanced(false);
      } finally {
        setIsProcessingEnhancement(false);
      }
-     */
 
-     // --- Placeholder Logic (Remove when AI flow is integrated) ---
-     // Simulate processing time
-     await new Promise(resolve => setTimeout(resolve, 1500));
-     // In a real scenario, you'd get the enhanced image URI from the AI
-     // For now, we just toggle the before/after view to show the original again
-     setShowBeforeAfter(true);
-      toast({
-        title: "Enhancement Processed (Placeholder)",
-        description: "Visual journey simulation complete.",
-      });
-     setIsProcessingEnhancement(false);
-     // --- End Placeholder Logic ---
    };
 
    const toggleBeforeAfter = () => {
-     setShowBeforeAfter(prev => !prev);
+      if (!originalImage || !uploadedImage) return; // Only allow toggle if both images exist
+
+     // If we are showing 'Before' (original) OR if the current view is NOT AI enhanced,
+     // then switch to showing the 'Enhanced' (uploadedImage, which might be AI enhanced or just preview)
+     if (showBeforeAfter || !uploadedImageIsAiEnhanced) {
+        setShowBeforeAfter(false);
+     } else {
+     // Otherwise, if we are showing the AI-enhanced image, switch to showing the 'Before' (original)
+        setShowBeforeAfter(true);
+     }
    }
 
    // --- Apply CSS Filters for Live Preview (Simplified) ---
    const getImageStyle = (): React.CSSProperties => {
-     if (showBeforeAfter) return {}; // Don't apply filters in 'before' view
+      // If showing 'Before' view OR if the image is already AI enhanced (don't double-apply filters)
+     if (showBeforeAfter || uploadedImageIsAiEnhanced) return {};
 
+     // Apply filters only for live preview before AI enhancement
      return {
        filter: `
          brightness(${1 + (enhancementValues.brightness - 0.5) * 1})
          contrast(${1 + (enhancementValues.contrast - 0.5) * 1})
          saturate(${1 + (enhancementValues.saturation - 0.5) * 1})
        `,
-       // Background blur and face smoothing are more complex and typically require canvas or AI processing
+       // Background blur and face smoothing are complex and applied by AI
      };
    };
 
 
    // --- Virtual Hand Animation Placeholder ---
+   // (Keep as placeholder for now, requires significant effort)
    const VirtualHand = () => {
-     // Basic placeholder, real implementation needs SVG and animation logic
-     const [position, setPosition] = useState({ x: 50, y: 50 }); // Example position state
-
-     useEffect(() => {
-       // Simulate hand moving based on which slider is active or based on enhancementJourney steps
-       // This is highly complex and requires mapping slider positions, etc.
-     }, [enhancementValues]); // Or trigger based on enhancementJourney
+     const [position, setPosition] = useState({ x: 50, y: 50 });
+     useEffect(() => {}, [enhancementJourney]); // Trigger based on journey
 
      return (
        <div
-         className="absolute text-4xl transition-transform duration-500 ease-in-out"
-        //  style={{ transform: `translate(${position.x}px, ${position.y}px)` }}
-        style={{ top: `${position.y}%`, left: `${position.x}%` }} // Example positioning
+         className="absolute text-4xl transition-transform duration-500 ease-in-out pointer-events-none" // Added pointer-events-none
+        style={{ top: `${position.y}%`, left: `${position.x}%`, transform: 'translate(-50%, -50%)' }} // Center hand on position
         aria-hidden="true"
        >
          <span role="img" aria-label="Hand pointing">👉</span>
@@ -287,7 +334,7 @@ export default function HeadshotApp() {
    // --- Tooltip Component Placeholder ---
     const EnhancementTooltip = ({ label, value }: { label: string; value: number }) => (
       <div className="text-xs text-muted-foreground mt-1">
-        {label}: {value.toFixed(2)} {/* Example tooltip content */}
+        {label}: {value.toFixed(2)}
       </div>
     );
 
@@ -335,7 +382,8 @@ export default function HeadshotApp() {
       <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Image Container */}
         <Card
-            className="lg:col-span-2 h-[60vh] lg:h-auto flex flex-col items-center justify-center p-4 relative overflow-hidden"
+            ref={imageContainerRef} // Assign ref here
+            className="lg:col-span-2 h-[60vh] lg:h-auto flex flex-col items-center justify-center p-4 relative overflow-hidden scroll-mt-20" // Added scroll-mt-20 for sticky header offset
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -344,43 +392,45 @@ export default function HeadshotApp() {
             <div className="relative w-full h-full max-w-full max-h-full flex items-center justify-center">
               <Image
                 src={showBeforeAfter ? originalImage! : uploadedImage} // Show original or enhanced based on state
-                alt={showBeforeAfter ? "Original image" : "Uploaded image preview"}
+                alt={showBeforeAfter ? "Original image" : (uploadedImageIsAiEnhanced ? "AI Enhanced image" : "Uploaded image preview")} // Dynamic alt text
                 fill
                 style={{ objectFit: 'contain', ...getImageStyle() }} // Use contain and apply styles
                 className="transition-all duration-300"
                 data-ai-hint="professional headshot"
+                priority // Prioritize loading the main image
               />
               {/* Placeholder for Virtual Hand */}
-              {/* {enhancementJourney && <VirtualHand />} */}
+              {/* {enhancementJourney && !isProcessingEnhancement && <VirtualHand />} */}
 
                {/* Before/After Toggle Button */}
-               {originalImage && (
+               {originalImage && uploadedImage && uploadedImageIsAiEnhanced && ( // Show only when AI enhanced image exists
                  <Button
                    variant="outline"
                    size="sm"
                    className="absolute top-2 right-2 z-10 bg-card/80 hover:bg-card"
                    onClick={toggleBeforeAfter}
+                   disabled={isProcessingEnhancement || isLoadingAI} // Disable during processing
                  >
-                   {showBeforeAfter ? 'Show Enhanced' : 'Show Original'}
+                   {showBeforeAfter ? 'Show AI Enhanced' : 'Show Original'}
                  </Button>
                )}
 
                {/* Processing Overlay */}
                {(isLoadingAI || isProcessingEnhancement) && (
-                  <div className="absolute inset-0 bg-background/70 flex flex-col items-center justify-center z-20">
+                  <div className="absolute inset-0 bg-background/80 flex flex-col items-center justify-center z-20 rounded-lg"> {/* Added rounded-lg */}
                     <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
-                    <p className="text-foreground text-lg">
-                      {isLoadingAI ? 'AI Analyzing...' : 'Applying Enhancements...'}
+                    <p className="text-foreground text-lg font-medium"> {/* Added font-medium */}
+                      {isLoadingAI ? 'AI Analyzing & Animating...' : 'Applying AI Enhancements...'}
                     </p>
                   </div>
                 )}
             </div>
           ) : (
             <div className="text-center text-muted-foreground flex flex-col items-center justify-center h-full border-2 border-dashed border-border rounded-lg p-8">
-              <Upload className="w-12 h-12 mb-4" />
-              <p className="mb-2">Drag & drop your image here</p>
+              <Upload className="w-12 h-12 mb-4 text-primary" /> {/* Added text-primary */}
+              <p className="mb-2 font-medium">Drag & drop your image here</p> {/* Added font-medium */}
               <p className="mb-4 text-sm">or</p>
-              <div className="flex gap-4">
+              <div className="flex flex-col sm:flex-row gap-4"> {/* Responsive button layout */}
                 <Button onClick={triggerFileInput}>
                   <Upload className="mr-2" /> Upload Image
                 </Button>
@@ -403,66 +453,68 @@ export default function HeadshotApp() {
 
 
         {/* Controls Container */}
-        <Card className="h-fit sticky top-24"> {/* Make controls sticky */}
+        <Card className="h-fit sticky top-24 self-start"> {/* Make controls sticky & align top */}
           <CardHeader>
             <CardTitle>Enhancement Controls</CardTitle>
           </CardHeader>
           <CardContent className="space-y-6">
-            {Object.entries(enhancementValues).map(([key, value]) => (
+            {(Object.keys(initialEnhancements) as Array<keyof EnhancementValues>).map((key) => (
               <div key={key} className="space-y-2">
                 <div className="flex justify-between items-center">
-                   <Label htmlFor={key} className="capitalize">
+                   <Label htmlFor={key} className="capitalize font-medium"> {/* Added font-medium */}
                      {key.replace(/([A-Z])/g, ' $1').replace('Background B', 'Bg B')} {/* Improve label formatting */}
                    </Label>
-                   <span className="text-sm font-medium text-primary">{value.toFixed(2)}</span>
+                   <span className="text-sm font-medium text-primary w-10 text-right">{enhancementValues[key].toFixed(2)}</span> {/* Fixed width & right align */}
                  </div>
                 <Slider
                   id={key}
                   min={0}
                   max={1}
                   step={0.01}
-                  value={[value]}
-                  onValueChange={(val) => handleSliderChange(key as keyof EnhancementValues, val)}
+                  value={[enhancementValues[key]]}
+                  onValueChange={(val) => handleSliderChange(key, val)}
                   disabled={!uploadedImage || isLoadingAI || isProcessingEnhancement}
                   aria-label={`${key} slider`}
+                  className="[&>span>span]:transition-transform [&>span>span]:duration-100 [&>span>span]:ease-linear" // Add smooth transition for animation
                 />
                 {/* Placeholder for educational tooltips */}
-                {/* <EnhancementTooltip label={key} value={value} /> */}
+                {/* <EnhancementTooltip label={key} value={enhancementValues[key]} /> */}
               </div>
             ))}
           </CardContent>
-           <CardFooter className="flex flex-col gap-4">
+           <CardFooter className="flex flex-col gap-4 pt-4"> {/* Added pt-4 */}
               <Button
                  onClick={handleSuggestEnhancements}
-                 disabled={!uploadedImage || isLoadingAI || isProcessingEnhancement}
+                 disabled={!originalImage || isLoadingAI || isProcessingEnhancement} // Disable if no original image
                  className="w-full"
                >
-                 <WandSparkles className="mr-2" /> Suggest Enhancements (AI)
+                 <WandSparkles className="mr-2" /> Suggest & Animate (AI)
                  {isLoadingAI && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-foreground ml-2"></div>}
                </Button>
                <Button
                  onClick={handleApplyEnhancements}
-                 disabled={!uploadedImage || isLoadingAI || isProcessingEnhancement}
-                 className="w-full bg-accent hover:bg-accent/90"
+                 disabled={!originalImage || isLoadingAI || isProcessingEnhancement} // Disable if no original image
+                 className="w-full bg-accent hover:bg-accent/90 text-accent-foreground" // Ensure contrast
                >
-                 Apply & See Journey
+                 Apply AI & See Journey
                  {isProcessingEnhancement && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent-foreground ml-2"></div>}
                </Button>
             </CardFooter>
         </Card>
-         {/* Placeholder for Analysis Results Panel */}
-         {/* {enhancementJourney && (
+
+         {/* Enhancement Journey/Results Panel */}
+         {enhancementJourney && !isProcessingEnhancement && (
             <Card className="mt-8 lg:col-span-3">
-               <CardHeader><CardTitle>Enhancement Journey</CardTitle></CardHeader>
+               <CardHeader><CardTitle>Enhancement Journey Steps</CardTitle></CardHeader>
                <CardContent>
-                 <ul className="list-disc pl-5 space-y-2">
+                 <ul className="list-decimal pl-5 space-y-2 text-sm"> {/* Use decimal list */}
                    {enhancementJourney.enhancementSteps.map((step, index) => (
-                     <li key={index}>{step}</li> // Render tooltips alongside
+                     <li key={index}>{step}</li> // Render steps directly
                    ))}
                  </ul>
                </CardContent>
              </Card>
-          )} */}
+          )}
       </main>
 
       {/* Footer */}
@@ -474,3 +526,5 @@ export default function HeadshotApp() {
     </div>
   );
 }
+
+    

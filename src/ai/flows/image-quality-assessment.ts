@@ -22,11 +22,16 @@ const ImageQualityAssessmentInputSchema = z.object({
 export type ImageQualityAssessmentInput = z.infer<typeof ImageQualityAssessmentInputSchema>;
 
 const ImageQualityAssessmentOutputSchema = z.object({
-  frontFacingScore: z.number().min(0).max(10).describe("Score from 0 (not front-facing at all) to 10 (perfectly front-facing)."),
-  eyeVisibilityScore: z.number().min(0).max(10).describe("Score from 0 (eyes not visible or closed) to 10 (both eyes clearly visible and open)."),
-  obstructionScore: z.number().min(0).max(10).describe("Score from 0 (no obstructions like glasses, hats, hair) to 10 (significant obstructions covering key facial features). Lower is better for obstructions."),
-  overallSuitabilityScore: z.number().min(0).max(10).describe("Overall suitability score as a professional headshot based on pose, clarity, and obstructions. 0 (unsuitable) to 10 (excellent)."),
-  feedback: z.array(z.string()).describe("A list of specific feedback points regarding the image quality, pose, eye visibility, and any obstructions noted."),
+  frontFacingScore: z.number().min(0).max(10).describe("Score from 0 (not front-facing) to 10 (perfectly front-facing)."),
+  eyeVisibilityScore: z.number().min(0).max(10).describe("Score from 0 (eyes not visible/closed) to 10 (both eyes clearly visible and open)."),
+  lightingQualityScore: z.number().min(0).max(10).describe("Score from 0 (poor lighting) to 10 (excellent, even facial lighting)."),
+  focusSharpnessScore: z.number().min(0).max(10).describe("Score from 0 (blurry/out of focus) to 10 (sharp focus on face and eyes)."),
+  backgroundAppropriatenessScore: z.number().min(0).max(10).describe("Score from 0 (distracting/inappropriate background) to 10 (clean, professional background)."),
+  expressionAppropriatenessScore: z.number().min(0).max(10).describe("Score from 0 (inappropriate/unprofessional expression) to 10 (engaging, professional expression)."),
+  headToBodyRatioScore: z.number().min(0).max(10).describe("Score from 0 (poor framing/composition) to 10 (good head & shoulders framing, well-centered)."),
+  obstructionScore: z.number().min(0).max(10).describe("Score from 0 (no obstructions) to 10 (significant obstructions covering key facial features). Lower is better."),
+  overallSuitabilityScore: z.number().min(0).max(10).describe("Overall suitability score as a professional headshot. 0 (unsuitable) to 10 (excellent)."),
+  feedback: z.array(z.string()).describe("A list of specific feedback points regarding all assessed criteria."),
 });
 export type ImageQualityAssessmentOutput = z.infer<typeof ImageQualityAssessmentOutputSchema>;
 
@@ -38,14 +43,19 @@ const prompt = ai.definePrompt({
   name: 'imageQualityAssessmentPrompt',
   input: {schema: ImageQualityAssessmentInputSchema},
   output: {schema: ImageQualityAssessmentOutputSchema},
-  prompt: `You are an AI expert in evaluating images for their suitability as professional headshots. Analyze the provided image based on the following criteria:
+  prompt: `You are an AI expert in evaluating images for their suitability as professional headshots. Analyze the provided image based on the following criteria, providing a score from 0 to 10 for each:
 
-1.  **Front-Facing Pose**: How directly is the subject facing the camera? A slight angle is acceptable, but the face should be generally oriented towards the viewer. Score 0-10.
-2.  **Eye Visibility**: Are both eyes clearly visible, open, and free from shadows or hair? Are they looking towards the camera or slightly off-camera in an engaging way? Score 0-10.
-3.  **Obstructions**: Are there any items obstructing the face, such as sunglasses, regular eyeglasses (note if they cause glare or hide eyes), hats, headscarves, or excessive hair covering the face? Score 0-10 (0 means no obstructions, 10 means highly obstructed).
-4.  **Overall Suitability**: Based on the above, and general image clarity (focus, lighting on face), provide an overall score for its use as a professional headshot. Score 0-10.
+1.  **Front-Facing Pose**: How directly is the subject facing the camera?
+2.  **Eye Visibility**: Are both eyes clearly visible, open, and engaging?
+3.  **Lighting Quality**: Is the face well-lit with even illumination and minimal harsh shadows?
+4.  **Focus/Sharpness**: Is the image, especially the face and eyes, sharp and in focus?
+5.  **Background Appropriateness**: Is the background uncluttered, non-distracting, and professional?
+6.  **Expression Appropriateness**: Is the subject's expression suitable for a professional context (e.g., genuine, neutral, engaging)?
+7.  **Head-to-Body Ratio/Framing**: Is the subject well-framed (typically head and shoulders) and centered?
+8.  **Obstructions**: Are there any items obstructing the face (sunglasses, hats, hair, etc.)? (0=no obstructions, 10=highly obstructed - lower score is better).
+9.  **Overall Suitability**: Based on all above, provide an overall suitability score.
 
-Provide specific feedback points as an array of strings. For example, if eyes are closed, mention it. If a hat is worn, mention it. If the pose is not front-facing, describe it.
+Provide specific feedback points as an array of strings for each criterion, especially for scores that are not perfect.
 
 Respond ONLY with the JSON object matching the output schema.
 

@@ -8,7 +8,7 @@ import { Slider } from '@/components/ui/slider';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
-import { Upload, Camera, WandSparkles, CheckSquare, Linkedin, Users, Info, AlertCircle, CheckCircle2, Eye, Smile, UserX } from 'lucide-react';
+import { Upload, Camera, WandSparkles, CheckSquare, Linkedin, Users, Info, AlertCircle, CheckCircle2, Eye, Smile, UserX, Lightbulb, Aperture, Image as ImageIcon, Drama, Ratio } from 'lucide-react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useToast } from '@/hooks/use-toast';
 import { suggestEnhancements, SuggestEnhancementsOutput } from '@/ai/flows/suggest-enhancements';
@@ -365,8 +365,8 @@ export default function HeadshotApp() {
         <Tooltip delayDuration={100}>
           <TooltipTrigger asChild>
             <div className="flex flex-col items-center text-center p-2 rounded-md hover:bg-accent/10 transition-colors cursor-default">
-              <Icon className={`w-8 h-8 mb-1 ${lowIsGood && score > (outOf * 0.6) ? 'text-destructive' : (score < (outOf * 0.4) && !lowIsGood ? 'text-destructive' : 'text-muted-foreground')}`} />
-              <span className={`font-semibold text-sm ${scoreColorClass}`}>{displayScore}</span>
+              <Icon className={`w-7 h-7 mb-1 ${lowIsGood && score > (outOf * 0.6) ? 'text-destructive' : (score < (outOf * 0.4) && !lowIsGood ? 'text-destructive' : 'text-muted-foreground')}`} />
+              <span className={`font-semibold text-xs ${scoreColorClass}`}>{displayScore}</span>
             </div>
           </TooltipTrigger>
           <TooltipContent side="bottom" className="max-w-xs text-xs p-2 z-50">
@@ -487,11 +487,8 @@ export default function HeadshotApp() {
             <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
             <CardContent>
               {isAssessingQuality && !imageQualityAssessment && (
-                <div className="grid grid-cols-4 gap-2"> {/* Changed to 4 columns */}
-                  <Skeleton className="h-20 w-full" />
-                  <Skeleton className="h-20 w-full" />
-                  <Skeleton className="h-20 w-full" />
-                  <Skeleton className="h-20 w-full" />
+                <div className="grid grid-cols-4 sm:grid-cols-8 gap-1"> {/* Responsive grid for 8 items */}
+                  {Array.from({ length: 9 }).map((_, i) => <Skeleton key={i} className="h-16 w-full" />)} {/* Increased to 9 for overall score */}
                 </div>
               )}
               {!isAssessingQuality && !uploadedImage && (
@@ -499,12 +496,20 @@ export default function HeadshotApp() {
               )}
               {imageQualityAssessment && (
                 <>
-                <div className="grid grid-cols-4 gap-2"> {/* Changed to 4 columns, consistent gap */}
+                <div className="grid grid-cols-4 sm:grid-cols-8 gap-1 mb-3"> {/* Responsive grid for 8 items */}
                   <QualityScoreIcon label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
                   <QualityScoreIcon label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
+                  <QualityScoreIcon label="Lighting Quality" score={imageQualityAssessment.lightingQualityScore} icon={Lightbulb} />
+                  <QualityScoreIcon label="Focus/Sharpness" score={imageQualityAssessment.focusSharpnessScore} icon={Aperture} />
+                  <QualityScoreIcon label="Background" score={imageQualityAssessment.backgroundAppropriatenessScore} icon={ImageIcon} />
+                  <QualityScoreIcon label="Expression" score={imageQualityAssessment.expressionAppropriatenessScore} icon={Drama} />
+                  <QualityScoreIcon label="Framing/Ratio" score={imageQualityAssessment.headToBodyRatioScore} icon={Ratio} />
                   <QualityScoreIcon label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
-                  <QualityScoreIcon label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
                 </div>
+                 <div className="border-t pt-3 mt-3 text-center"> {/* Added border-t and margin-top for separation */}
+                     <Label className="text-sm font-medium text-muted-foreground mb-1 block">Overall Suitability</Label>
+                     <QualityScoreIcon label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
+                 </div>
                 
                 {imageQualityAssessment.feedback.length > 0 && (
                     <div className="mt-4 pt-3 border-t">
@@ -597,4 +602,3 @@ export default function HeadshotApp() {
     </div>
   );
 }
-

@@ -217,18 +217,14 @@ export default function HeadshotApp() {
     }
     setIsLoadingAI(true);
     setShowBeforeAfter(false);
-    // setUploadedImageIsAiEnhanced(false); // Don't reset this, as we are not applying yet
     setEnhancementJourney(null);
     setSuggestionRationale(null);
-    // Don't revert to original image visually, let user see current state while suggestions load
-    // setUploadedImage(originalImage); 
 
     try {
       const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: originalImage });
       const animationDurationPerSlider = 400;
       setSuggestionRationale(suggestions.rationale);
 
-      // Animate sliders to suggested values but don't "apply" them to the image yet
       await animateSlider('brightness', suggestions.brightness, animationDurationPerSlider);
       await animateSlider('contrast', suggestions.contrast, animationDurationPerSlider);
       await animateSlider('saturation', suggestions.saturation, animationDurationPerSlider);
@@ -263,17 +259,15 @@ export default function HeadshotApp() {
      }
      setIsProcessingEnhancement(true);
      setEnhancementJourney(null);
-     setShowBeforeAfter(false); // Start by showing the enhanced image
+     setShowBeforeAfter(false); 
 
      if(imageContainerRef.current) {
        imageContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
      }
     
-    // First, animate sliders one by one. The image itself will be updated at the end.
-    const animationDurationPerSlider = 300; // Shorter duration for visual effect
-    const currentSettings = {...enhancementValues}; // Capture current settings for AI
+    const animationDurationPerSlider = 300; 
+    const currentSettings = {...enhancementValues}; 
 
-    // Simulate animating each slider to its current value if not already there (this is more for show)
     await animateSlider('brightness', currentSettings.brightness, animationDurationPerSlider);
     await animateSlider('contrast', currentSettings.contrast, animationDurationPerSlider);
     await animateSlider('saturation', currentSettings.saturation, animationDurationPerSlider);
@@ -283,12 +277,12 @@ export default function HeadshotApp() {
 
      try {
        const journeyResult = await generateEnhancementJourney({
-         photoDataUri: originalImage, // Always enhance from the original
-         ...currentSettings, // Use the slider values that were just "animated"
+         photoDataUri: originalImage, 
+         ...currentSettings, 
        });
        setUploadedImage(journeyResult.enhancedPhotoDataUri);
        setEnhancementJourney(journeyResult);
-       setUploadedImageIsAiEnhanced(true); // Mark that the current view is AI enhanced
+       setUploadedImageIsAiEnhanced(true); 
        toast({
          title: "Enhancement Applied",
          description: "Image enhanced by AI using current settings. See journey steps.",
@@ -300,7 +294,7 @@ export default function HeadshotApp() {
          description: `Could not apply AI enhancements. ${error instanceof Error ? error.message : ''}`,
          variant: "destructive",
        });
-       setUploadedImage(originalImage); // Revert to original on error
+       setUploadedImage(originalImage); 
        setUploadedImageIsAiEnhanced(false);
      } finally {
        setIsProcessingEnhancement(false);
@@ -308,18 +302,16 @@ export default function HeadshotApp() {
    };
 
    const toggleBeforeAfter = () => {
-      if (!originalImage || !uploadedImage) return; // Needs original and *some* uploaded image
+      if (!originalImage || !uploadedImage) return; 
      
-      if (showBeforeAfter) { // If currently showing original, switch to enhanced
-        setUploadedImage(enhancementJourney?.enhancedPhotoDataUri || originalImage); // Use AI enhanced if available
+      if (showBeforeAfter) { 
+        setUploadedImage(enhancementJourney?.enhancedPhotoDataUri || originalImage); 
         setShowBeforeAfter(false);
-      } else { // If currently showing enhanced (or initial upload), switch to original
-        // No need to change uploadedImage here, just toggle the flag
+      } else { 
         setShowBeforeAfter(true);
       }
    }
   
-   // Image style is only for client-side preview when NOT AI enhanced and NOT showing "before"
    const getImageStyle = (): React.CSSProperties => {
      if (showBeforeAfter || uploadedImageIsAiEnhanced) return {};
      return {
@@ -329,7 +321,6 @@ export default function HeadshotApp() {
          saturate(${1 + (enhancementValues.saturation - 0.5) * 1})
          blur(${(enhancementValues.backgroundBlur * 5)}px)
        `,
-       // Note: Face smoothing cannot be easily previewed with CSS filters
      };
    };
 
@@ -352,22 +343,28 @@ export default function HeadshotApp() {
      );
    };
 
-  const ScoreDisplay = ({ label, score, icon: Icon, lowIsGood = false, outOf = 10 }: { label: string, score: number, icon?: React.ElementType, lowIsGood?: boolean, outOf?:number }) => {
+  const QualityScoreIcon = ({ label, score, icon: Icon, lowIsGood = false, outOf = 10 }: { label: string, score: number, icon: React.ElementType, lowIsGood?: boolean, outOf?:number }) => {
     const displayScore = outOf === 10 ? `${score}/${outOf}` : `${(score * 100 / outOf).toFixed(0)}%`;
-    let scoreColorClass = 'text-primary'; // Default
+    let scoreColorClass = 'text-primary'; 
     const percentage = score * (100 / outOf);
 
     if ((!lowIsGood && percentage < 40) || (lowIsGood && percentage >= 70)) scoreColorClass = 'text-destructive';
-    else if ((!lowIsGood && percentage < 70) || (lowIsGood && percentage >= 40)) scoreColorClass = 'text-yellow-500'; // You might need to define this color in globals.css or use a Tailwind class like text-yellow-500
+    else if ((!lowIsGood && percentage < 70) || (lowIsGood && percentage >= 40)) scoreColorClass = 'text-yellow-500';
     
     return (
-      <div className="flex items-center justify-between text-sm py-1">
-        <span className="font-medium flex items-center">
-          {Icon && <Icon className={`w-4 h-4 mr-2 ${lowIsGood && score > (outOf * 0.6) ? 'text-destructive' : (score < (outOf * 0.4) && !lowIsGood ? 'text-destructive' : 'text-muted-foreground')}`} />}
-          {label}
-        </span>
-        <span className={`font-semibold ${scoreColorClass}`}>{displayScore}</span>
-      </div>
+      <TooltipProvider>
+        <Tooltip delayDuration={100}>
+          <TooltipTrigger asChild>
+            <div className="flex flex-col items-center text-center p-2 rounded-md hover:bg-accent/50 transition-colors">
+              <Icon className={`w-8 h-8 mb-1 ${lowIsGood && score > (outOf * 0.6) ? 'text-destructive' : (score < (outOf * 0.4) && !lowIsGood ? 'text-destructive' : 'text-muted-foreground')}`} />
+              <span className={`font-semibold text-sm ${scoreColorClass}`}>{displayScore}</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-xs text-xs p-2 z-50">
+            <p>{label}</p>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     );
   };
 
@@ -409,10 +406,10 @@ export default function HeadshotApp() {
         </div>
       </header>
 
-      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]"> {/* 8rem for header and footer approx */}
+      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]">
         <div
             ref={imageContainerRef}
-            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full" // Ensure image container takes available height
+            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full"
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -474,36 +471,34 @@ export default function HeadshotApp() {
           )}
         </div>
 
-        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full"> {/* Allow this column to scroll */}
+        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full">
           {/* Image Quality Assessment Panel */}
           <Card className="flex-shrink-0">
             <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
-            <CardContent className="space-y-2">
+            <CardContent>
               {isAssessingQuality && !imageQualityAssessment && (
-                <>
-                  <Skeleton className="h-6 w-3/4" />
-                  <Skeleton className="h-6 w-full" />
-                  <Skeleton className="h-6 w-3/4 mt-1" />
-                  <Skeleton className="h-6 w-full mt-1" />
-                  <Skeleton className="h-6 w-3/4 mt-1" />
-                  <Skeleton className="h-6 w-full mt-1" />
-                  <Skeleton className="h-6 w-1/2 mt-2" />
-                  <Skeleton className="h-4 w-full mt-1" />
-                </>
+                <div className="grid grid-cols-2 gap-4">
+                  <Skeleton className="h-20 w-full" />
+                  <Skeleton className="h-20 w-full" />
+                  <Skeleton className="h-20 w-full" />
+                  <Skeleton className="h-20 w-full" />
+                </div>
               )}
               {!isAssessingQuality && !uploadedImage && (
-                <p className="text-sm text-muted-foreground">Upload an image for quality assessment.</p>
+                <p className="text-sm text-muted-foreground p-4 text-center">Upload an image for quality assessment.</p>
               )}
               {imageQualityAssessment && (
                 <>
-                  <ScoreDisplay label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
-                  <ScoreDisplay label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
-                  <ScoreDisplay label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
-                  <ScoreDisplay label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
-
-                  {imageQualityAssessment.feedback.length > 0 && (
-                    <div>
-                      <h4 className="text-sm font-semibold mb-1 mt-3">AI Feedback:</h4>
+                <div className="grid grid-cols-2 gap-x-2 gap-y-4">
+                  <QualityScoreIcon label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
+                  <QualityScoreIcon label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
+                  <QualityScoreIcon label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
+                  <QualityScoreIcon label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
+                </div>
+                
+                {imageQualityAssessment.feedback.length > 0 && (
+                    <div className="mt-4 pt-3 border-t">
+                      <h4 className="text-sm font-semibold mb-1">AI Feedback:</h4>
                       <ul className="list-disc pl-5 space-y-1 text-xs text-muted-foreground">
                         {imageQualityAssessment.feedback.map((item, index) => (
                           <li key={index}>{item}</li>

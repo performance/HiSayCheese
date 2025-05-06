@@ -1,4 +1,3 @@
-
 'use client';
 
 import type { ChangeEvent } from 'react';
@@ -8,7 +7,7 @@ import { Slider } from '@/components/ui/slider';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
-import { Upload, Camera, WandSparkles, CheckSquare, Linkedin, Users, Info, AlertCircle, CheckCircle2, Eye, Smile, UserX, Lightbulb, Aperture, Image as ImageIcon, Drama, Ratio } from 'lucide-react';
+import { Upload, Camera, WandSparkles, CheckSquare, Linkedin, Users, Info, AlertCircle, CheckCircle2, Eye, Smile, UserX, Lightbulb, Aperture, Image as ImageIcon, Drama, Ratio, ArrowLeft, ArrowRight } from 'lucide-react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useToast } from '@/hooks/use-toast';
 import { suggestEnhancements, SuggestEnhancementsOutput } from '@/ai/flows/suggest-enhancements';
@@ -16,6 +15,8 @@ import { generateEnhancementJourney, GenerateEnhancementJourneyOutput } from '@/
 import { assessImageQuality, ImageQualityAssessmentOutput } from '@/ai/flows/image-quality-assessment';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious, type CarouselApi } from '@/components/ui/carousel';
+
 
 // --- Enhancement Controls Type ---
 interface EnhancementValues {
@@ -37,37 +38,123 @@ const initialEnhancements: EnhancementValues = {
 
 type SuggestionRationale = SuggestEnhancementsOutput['rationale'];
 
+// --- Carousel Slide Types ---
+type CarouselSlide = {
+  id: string;
+  title: string;
+  imageSrc: string | null;
+  altText: string;
+  caption?: React.ReactNode;
+  isAiEnhanced?: boolean; // To differentiate AI enhanced image for styling/filtering
+};
+
+
 // --- Main Component ---
 export default function HeadshotApp() {
-  const [uploadedImage, setUploadedImage] = useState<string | null>(null);
-  const [originalImage, setOriginalImage] = useState<string | null>(null);
+  const [uploadedImage, setUploadedImage] = useState<string | null>(null); // Used for applying client-side filters
+  const [originalImage, setOriginalImage] = useState<string | null>(null); // Stores the very first uploaded image
   const [enhancementValues, setEnhancementValues] = useState<EnhancementValues>(initialEnhancements);
   const [mode, setMode] = useState<string>('professional');
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [isProcessingEnhancement, setIsProcessingEnhancement] = useState(false);
-  const [showBeforeAfter, setShowBeforeAfter] = useState(false);
   const [enhancementJourney, setEnhancementJourney] = useState<GenerateEnhancementJourneyOutput | null>(null);
-  const [uploadedImageIsAiEnhanced, setUploadedImageIsAiEnhanced] = useState(false);
   const [suggestionRationale, setSuggestionRationale] = useState<SuggestionRationale | null>(null);
   
   const [imageQualityAssessment, setImageQualityAssessment] = useState<ImageQualityAssessmentOutput | null>(null);
   const [isAssessingQuality, setIsAssessingQuality] = useState(false);
 
+  const [carouselApi, setCarouselApi] = useState<CarouselApi>();
+  const [currentSlide, setCurrentSlide] = useState(0);
+  const [carouselSlides, setCarouselSlides] = useState<CarouselSlide[]>([]);
+
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const imageContainerRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
 
+  // Update carousel slides when relevant data changes
+  useEffect(() => {
+    if (!originalImage) {
+      setCarouselSlides([]);
+      setCurrentSlide(0);
+      return;
+    }
+
+    const slides: CarouselSlide[] = [
+      {
+        id: 'original',
+        title: 'Original Image',
+        imageSrc: originalImage,
+        altText: 'Original uploaded image',
+      },
+    ];
+
+    if (imageQualityAssessment) {
+      slides.push({
+        id: 'quality-assessed',
+        title: 'Image Quality Assessed',
+        imageSrc: originalImage,
+        altText: 'Image after quality assessment',
+        caption: (
+          <p className="text-xs text-muted-foreground p-2 bg-background/80 rounded-md mt-1">
+            Quality assessed. Scores available in the panel.
+            Overall: {imageQualityAssessment.overallSuitabilityScore}/10
+          </p>
+        ),
+      });
+    }
+    
+    if (suggestionRationale && !enhancementJourney) {
+       slides.push({
+        id: 'suggestions-ready',
+        title: 'AI Suggestions Ready',
+        imageSrc: originalImage, // Show original before applying
+        altText: 'Image with AI suggestions ready',
+        caption: (
+          <p className="text-xs text-muted-foreground p-2 bg-background/80 rounded-md mt-1">
+            AI suggestions loaded and sliders animated. Click "Apply AI" to see changes.
+          </p>
+        ),
+      });
+    }
+
+
+    if (enhancementJourney?.enhancedPhotoDataUri) {
+      slides.push({
+        id: 'ai-enhanced',
+        title: 'AI Enhanced Headshot',
+        imageSrc: enhancementJourney.enhancedPhotoDataUri,
+        altText: 'AI Enhanced headshot',
+        isAiEnhanced: true,
+      });
+    }
+    setCarouselSlides(slides);
+  }, [originalImage, imageQualityAssessment, suggestionRationale, enhancementJourney]);
+
+  // Effect for Carousel API
+  useEffect(() => {
+    if (!carouselApi) {
+      return;
+    }
+    setCurrentSlide(carouselApi.selectedScrollSnap());
+    carouselApi.on("select", () => {
+      setCurrentSlide(carouselApi.selectedScrollSnap());
+    });
+     // Ensure carousel scrolls to the latest slide when new slides are added
+    if (carouselSlides.length > 0) {
+      // Debounce or delay slightly to allow DOM update
+      setTimeout(() => carouselApi.scrollTo(carouselSlides.length - 1, false), 100);
+    }
+  }, [carouselApi, carouselSlides.length]);
+
+
   const processUploadedImage = async (dataUri: string) => {
-    setUploadedImage(dataUri);
-    setOriginalImage(dataUri);
-    setShowBeforeAfter(false);
-    setUploadedImageIsAiEnhanced(false);
+    setOriginalImage(dataUri); // Set original image first
+    setUploadedImage(dataUri); // Set uploaded image for preview filtering
     setEnhancementJourney(null);
     setSuggestionRationale(null);
-    setImageQualityAssessment(null); // Reset assessment
+    setImageQualityAssessment(null);
     setEnhancementValues(initialEnhancements);
-
+    carouselApi?.scrollTo(0, true); // Go to first slide instantly
 
     toast({
       title: "Image Uploaded",
@@ -82,6 +169,8 @@ export default function HeadshotApp() {
         title: "Image Quality Assessed",
         description: "Check the assessment panel for details.",
       });
+       // Wait for state update then scroll
+       setTimeout(() => carouselApi?.scrollTo(1, false), 100);
     } catch (error) {
       console.error("Error assessing image quality:", error);
       toast({
@@ -180,28 +269,37 @@ export default function HeadshotApp() {
 
   const handleSliderChange = (key: keyof EnhancementValues, value: number[]) => {
     setEnhancementValues((prev) => ({ ...prev, [key]: value[0] }));
+    // When user manually changes slider, reset AI enhanced image preview if current slide shows it
+    // And revert `uploadedImage` to original for client-side filtering, unless we are on the "AI Enhanced" slide specifically.
+    const currentCarouselSlide = carouselSlides[currentSlide];
+    if (currentCarouselSlide?.id !== 'ai-enhanced' && enhancementJourney) {
+       setUploadedImage(originalImage); // Allow client-side preview with manual slider changes
+    }
   };
 
   const animateSlider = (key: keyof EnhancementValues, targetValue: number, duration: number = 500) => {
     return new Promise<void>((resolve) => {
-      const startValue = enhancementValues[key];
-      const startTime = performance.now();
+      setEnhancementValues(prev => {
+          const startValue = prev[key];
+          const startTime = performance.now();
 
-      const step = (currentTime: number) => {
-        const elapsedTime = currentTime - startTime;
-        const progress = Math.min(elapsedTime / duration, 1);
-        const currentValue = startValue + (targetValue - startValue) * progress;
+          const step = (currentTime: number) => {
+            const elapsedTime = currentTime - startTime;
+            const progress = Math.min(elapsedTime / duration, 1);
+            const currentValue = startValue + (targetValue - startValue) * progress;
 
-        setEnhancementValues((prev) => ({ ...prev, [key]: currentValue }));
+            setEnhancementValues((prevStep) => ({ ...prevStep, [key]: currentValue }));
 
-        if (progress < 1) {
+            if (progress < 1) {
+              requestAnimationFrame(step);
+            } else {
+              setEnhancementValues((prevStep) => ({ ...prevStep, [key]: targetValue }));
+              resolve();
+            }
+          };
           requestAnimationFrame(step);
-        } else {
-          setEnhancementValues((prev) => ({ ...prev, [key]: targetValue }));
-          resolve();
-        }
-      };
-      requestAnimationFrame(step);
+          return prev; // Return previous state to avoid immediate re-render from this setter
+      });
     });
   };
 
@@ -216,18 +314,16 @@ export default function HeadshotApp() {
       return;
     }
     setIsLoadingAI(true);
-    setShowBeforeAfter(false);
-    setEnhancementJourney(null);
+    setEnhancementJourney(null); // Clear previous AI journey
     setSuggestionRationale(null);
-    // Do not apply client side filter for suggested enhancements immediately
-    // setUploadedImage(originalImage); 
-    // setUploadedImageIsAiEnhanced(false);
+    setUploadedImage(originalImage); // Reset to original for client-side preview to take effect if user changes sliders
+
 
     try {
       const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: originalImage });
       const animationDurationPerSlider = 400;
       setSuggestionRationale(suggestions.rationale);
-
+      
       // Animate sliders to suggested values
       await animateSlider('brightness', suggestions.brightness, animationDurationPerSlider);
       await animateSlider('contrast', suggestions.contrast, animationDurationPerSlider);
@@ -239,6 +335,12 @@ export default function HeadshotApp() {
         title: "AI Suggestions Loaded",
         description: "Sliders animated to suggested values. Hover over (i) for rationale. Click 'Apply AI' to see changes on the image.",
       });
+      // After suggestions, ensure the "suggestions-ready" slide is shown if it exists
+      const suggestionsSlideIndex = carouselSlides.findIndex(s => s.id === 'suggestions-ready');
+      if (suggestionsSlideIndex !== -1) {
+        setTimeout(() => carouselApi?.scrollTo(suggestionsSlideIndex, false), 100);
+      }
+
     } catch (error) {
       console.error("Error suggesting enhancements:", error);
       toast({
@@ -262,33 +364,38 @@ export default function HeadshotApp() {
        return;
      }
      setIsProcessingEnhancement(true);
-     setEnhancementJourney(null);
-     setShowBeforeAfter(false); 
-
-     if(imageContainerRef.current) {
-       imageContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
-     }
+     setEnhancementJourney(null); // Clear previous journey first
     
-    // Use current slider values for enhancement
     const currentSettings = {...enhancementValues}; 
-
-    // Animate sliders to ensure they reflect current settings during processing (visual feedback)
-    // No need to re-animate sliders if they are already at currentSettings
-    // This section can be simplified if sliders already reflect enhancementValues.
-    // The primary goal here is to trigger the AI enhancement with current values.
 
      try {
        const journeyResult = await generateEnhancementJourney({
          photoDataUri: originalImage, 
-         ...currentSettings, // Use current slider values
+         ...currentSettings,
        });
-       setUploadedImage(journeyResult.enhancedPhotoDataUri);
        setEnhancementJourney(journeyResult);
-       setUploadedImageIsAiEnhanced(true); 
+       // uploadedImage will be updated by the carousel effect when the AI enhanced slide becomes active
        toast({
          title: "Enhancement Applied",
          description: "Image enhanced by AI using current settings. See journey steps below.",
        });
+        // After applying, ensure the "ai-enhanced" slide is shown if it exists
+        setTimeout(() => {
+          const enhancedSlideIndex = carouselSlides.findIndex(s => s.id === 'ai-enhanced');
+          if (enhancedSlideIndex !== -1) {
+             carouselApi?.scrollTo(enhancedSlideIndex, false)
+          } else { // If slide not yet created due to state update lag, try again
+            setTimeout(() => {
+                const newSlides = carouselSlides; // Re-check potentially updated slides
+                const newEnhancedSlideIndex = newSlides.findIndex(s => s.id === 'ai-enhanced');
+                if (newEnhancedSlideIndex !== -1) {
+                    carouselApi?.scrollTo(newEnhancedSlideIndex, false);
+                }
+            }, 200);
+          }
+        }, 100);
+
+
      } catch (error) {
        console.error("Error applying enhancement journey:", error);
        toast({
@@ -297,30 +404,15 @@ export default function HeadshotApp() {
          variant: "destructive",
        });
        setUploadedImage(originalImage); 
-       setUploadedImageIsAiEnhanced(false);
      } finally {
        setIsProcessingEnhancement(false);
      }
    };
-
-   const toggleBeforeAfter = () => {
-      if (!originalImage || !uploadedImage) return; 
-     
-      if (showBeforeAfter) { 
-        // If currently showing original, switch to AI enhanced (if available) or latest client-side preview
-        setUploadedImage(enhancementJourney?.enhancedPhotoDataUri || uploadedImage); 
-        setShowBeforeAfter(false);
-      } else { 
-        // If currently showing enhanced/preview, switch to original
-        // No need to change uploadedImage here, as it's used by getImageStyle for original
-        setShowBeforeAfter(true);
-      }
-   }
   
-   const getImageStyle = (): React.CSSProperties => {
-     // If showing 'before' (original), or if an AI-enhanced image is currently set, don't apply client-side filters.
-     if (showBeforeAfter || uploadedImageIsAiEnhanced) return {};
-     // Otherwise, apply client-side filters based on slider values for preview.
+   const getImageStyle = (isAiEnhancedSlide: boolean | undefined): React.CSSProperties => {
+     // If it's an AI-enhanced slide, or no original image, don't apply client-side filters.
+     if (isAiEnhancedSlide || !originalImage) return {};
+     // Otherwise, apply client-side filters based on slider values for preview on non-AI-enhanced slides.
      return {
        filter: `
          brightness(${1 + (enhancementValues.brightness - 0.5) * 1})
@@ -328,8 +420,6 @@ export default function HeadshotApp() {
          saturate(${1 + (enhancementValues.saturation - 0.5) * 1})
          blur(${(enhancementValues.backgroundBlur * 5)}px)
        `,
-       // Note: Face smoothing is harder to preview client-side accurately without ML.
-       // It will only be visible on the AI-enhanced image.
      };
    };
 
@@ -344,7 +434,7 @@ export default function HeadshotApp() {
                <Info className="w-3 h-3" />
              </span>
            </TooltipTrigger>
-           <TooltipContent side="top" align="start" className="max-w-xs text-xs p-2 z-50">
+           <TooltipContent side="top" align="start" className="max-w-xs text-xs p-2 z-[100]"> {/* Increased z-index */}
              <p>{rationale}</p>
            </TooltipContent>
          </Tooltip>
@@ -369,7 +459,7 @@ export default function HeadshotApp() {
               <span className={`font-semibold text-xs ${scoreColorClass}`}>{displayScore}</span>
             </div>
           </TooltipTrigger>
-          <TooltipContent side="bottom" className="max-w-xs text-xs p-2 z-50">
+          <TooltipContent side="bottom" className="max-w-xs text-xs p-2 z-[100]"> {/* Increased z-index */}
             <p>{label}</p>
           </TooltipContent>
         </Tooltip>
@@ -415,47 +505,14 @@ export default function HeadshotApp() {
         </div>
       </header>
 
-      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]"> {/* 8rem = header + footer height approx */}
+      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]">
         <div
-            ref={imageContainerRef}
-            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full" // h-full for vertical fill
+            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full"
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
         >
-          {uploadedImage ? (
-            <div className="relative w-full h-full flex items-center justify-center">
-              <Image
-                src={showBeforeAfter ? originalImage! : uploadedImage}
-                alt={showBeforeAfter ? "Original image" : (uploadedImageIsAiEnhanced ? "AI Enhanced image" : "Uploaded image preview")}
-                fill
-                style={{ objectFit: 'contain', ...getImageStyle() }}
-                className="transition-all duration-300"
-                data-ai-hint="professional headshot"
-                priority // Prioritize loading of the main image
-              />
-               {originalImage && uploadedImage && uploadedImageIsAiEnhanced && (
-                 <Button
-                   variant="outline"
-                   size="sm"
-                   className="absolute top-2 right-2 z-10 bg-card/80 hover:bg-card"
-                   onClick={toggleBeforeAfter}
-                   disabled={isProcessingEnhancement || isLoadingAI || isAssessingQuality}
-                 >
-                   {showBeforeAfter ? 'Show AI Enhanced' : 'Show Original'}
-                 </Button>
-               )}
-
-               {(isLoadingAI || isProcessingEnhancement || isAssessingQuality) && (
-                  <div className="absolute inset-0 bg-background/80 flex flex-col items-center justify-center z-20 rounded-lg">
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
-                    <p className="text-foreground text-lg font-medium">
-                      {isAssessingQuality ? 'AI Assessing Quality...' : (isLoadingAI ? 'AI Analyzing & Animating...' : 'Applying AI Enhancements...')}
-                    </p>
-                  </div>
-                )}
-            </div>
-          ) : (
+          {!originalImage ? (
             <div className="text-center text-muted-foreground flex flex-col items-center justify-center h-full border-2 border-dashed border-border rounded-lg p-8">
               <Upload className="w-12 h-12 mb-4 text-primary" />
               <p className="mb-2 font-medium">Drag & drop your image here</p>
@@ -477,26 +534,75 @@ export default function HeadshotApp() {
               />
               <p className="mt-4 text-xs">Supports JPG, PNG, WEBP (Max 10MB)</p>
             </div>
+          ) : (
+            <Carousel setApi={setCarouselApi} className="w-full h-full">
+              <CarouselContent className="h-full">
+                {carouselSlides.map((slide) => (
+                  <CarouselItem key={slide.id} className="h-full flex flex-col items-center justify-center">
+                    <div className="relative w-full h-[calc(100%-2rem)] flex items-center justify-center"> {/* Adjust height for caption */}
+                      {slide.imageSrc && (
+                        <Image
+                          src={slide.imageSrc}
+                          alt={slide.altText}
+                          fill
+                          style={{ objectFit: 'contain', ...getImageStyle(slide.isAiEnhanced) }}
+                          className="transition-all duration-300"
+                          data-ai-hint="professional headshot portrait"
+                          priority={slide.id === 'original'}
+                        />
+                      )}
+                    </div>
+                    {slide.caption && (
+                        <div className="text-center text-sm mt-1 max-w-full truncate px-2">
+                            {slide.caption}
+                        </div>
+                    )}
+                  </CarouselItem>
+                ))}
+              </CarouselContent>
+              {carouselSlides.length > 1 && (
+                <>
+                    <CarouselPrevious 
+                        variant="ghost" 
+                        className="absolute left-2 top-1/2 -translate-y-1/2 z-10 bg-card/50 hover:bg-card/80 disabled:opacity-30"
+                        disabled={!carouselApi?.canScrollPrev() || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                    />
+                    <CarouselNext 
+                        variant="ghost" 
+                        className="absolute right-2 top-1/2 -translate-y-1/2 z-10 bg-card/50 hover:bg-card/80 disabled:opacity-30"
+                        disabled={!carouselApi?.canScrollNext() || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                    />
+                </>
+              )}
+              {(isLoadingAI || isProcessingEnhancement || isAssessingQuality) && (
+                  <div className="absolute inset-0 bg-background/80 flex flex-col items-center justify-center z-20 rounded-lg">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
+                    <p className="text-foreground text-lg font-medium">
+                      {isAssessingQuality ? 'AI Assessing Quality...' : (isLoadingAI ? 'AI Analyzing & Animating...' : 'Applying AI Enhancements...')}
+                    </p>
+                  </div>
+              )}
+            </Carousel>
           )}
         </div>
 
         {/* Controls Column */}
-        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full"> {/* h-full for vertical fill */}
+        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full">
           {/* Image Quality Assessment Panel */}
           <Card className="flex-shrink-0">
             <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
             <CardContent>
               {isAssessingQuality && !imageQualityAssessment && (
-                <div className="grid grid-cols-4 sm:grid-cols-8 gap-1"> {/* Responsive grid for 8 items */}
-                  {Array.from({ length: 9 }).map((_, i) => <Skeleton key={i} className="h-16 w-full" />)} {/* Increased to 9 for overall score */}
+                <div className="grid grid-cols-4 sm:grid-cols-8 gap-1">
+                  {Array.from({ length: 9 }).map((_, i) => <Skeleton key={i} className="h-16 w-full" />)}
                 </div>
               )}
-              {!isAssessingQuality && !uploadedImage && (
+              {!isAssessingQuality && !originalImage && (
                 <p className="text-sm text-muted-foreground p-4 text-center">Upload an image for quality assessment.</p>
               )}
               {imageQualityAssessment && (
                 <>
-                <div className="grid grid-cols-4 sm:grid-cols-8 gap-1 mb-3"> {/* Responsive grid for 8 items */}
+                <div className="grid grid-cols-4 sm:grid-cols-8 gap-1 mb-3">
                   <QualityScoreIcon label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
                   <QualityScoreIcon label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
                   <QualityScoreIcon label="Lighting Quality" score={imageQualityAssessment.lightingQualityScore} icon={Lightbulb} />
@@ -506,7 +612,7 @@ export default function HeadshotApp() {
                   <QualityScoreIcon label="Framing/Ratio" score={imageQualityAssessment.headToBodyRatioScore} icon={Ratio} />
                   <QualityScoreIcon label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
                 </div>
-                 <div className="border-t pt-3 mt-3 text-center"> {/* Added border-t and margin-top for separation */}
+                 <div className="border-t pt-3 mt-3 text-center">
                      <Label className="text-sm font-medium text-muted-foreground mb-1 block">Overall Suitability</Label>
                      <QualityScoreIcon label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
                  </div>
@@ -547,7 +653,7 @@ export default function HeadshotApp() {
                     step={0.01}
                     value={[enhancementValues[key]]}
                     onValueChange={(val) => handleSliderChange(key, val)}
-                    disabled={!uploadedImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                    disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
                     aria-label={`${key} slider`}
                     className="[&>span:last-child]:transition-transform [&>span:last-child]:duration-100 [&>span:last-child]:ease-linear h-2"
                   />
@@ -560,7 +666,7 @@ export default function HeadshotApp() {
                    disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
                    className="w-full"
                  >
-                   <WandSparkles className="mr-2 h-4 w-4" /> Suggest & Animate (AI)
+                   <WandSparkles className="mr-2 h-4 w-4" /> Suggest &amp; Animate (AI)
                    {isLoadingAI && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-foreground ml-2"></div>}
                  </Button>
                  <Button
@@ -568,13 +674,13 @@ export default function HeadshotApp() {
                    disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
                    className="w-full bg-accent hover:bg-accent/90 text-accent-foreground"
                  >
-                   Apply AI & See Journey
+                   Apply AI &amp; See Journey
                    {isProcessingEnhancement && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent-foreground ml-2"></div>}
                  </Button>
               </CardFooter>
           </Card>
-
-           {enhancementJourney && !isProcessingEnhancement && (
+          
+           {enhancementJourney && carouselSlides[currentSlide]?.id === 'ai-enhanced' && !isProcessingEnhancement && (
               <Card className="flex-shrink-0">
                  <CardHeader><CardTitle className="text-xl">Enhancement Journey</CardTitle></CardHeader>
                  <CardContent>
@@ -594,7 +700,7 @@ export default function HeadshotApp() {
         </div>
       </main>
 
-      <footer className="bg-card border-t mt-auto flex-shrink-0"> {/* mt-auto pushes footer to bottom if content is short */}
+      <footer className="bg-card border-t mt-auto flex-shrink-0">
         <div className="container mx-auto px-4 py-3 text-center text-muted-foreground text-xs">
           &copy; {new Date().getFullYear()} Headshot Handcrafter. All rights reserved.
         </div>

@@ -89,3 +89,16 @@ body {
     @apply bg-background text-foreground;
   }
 }
+
+/* Add these utility classes for progress bar colors */
+@layer utilities {
+  .bg-green-500 {
+    background-color: #22c55e; /* Tailwind green-500 */
+  }
+  .bg-yellow-500 {
+    background-color: #eab308; /* Tailwind yellow-500 */
+  }
+  .bg-red-500 {
+    background-color: #ef4444; /* Tailwind red-500 */
+  }
+}

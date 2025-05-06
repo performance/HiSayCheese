@@ -103,8 +103,8 @@ const generateEnhancementJourneyFlow = ai.defineFlow(
         // Optional: Adjust temperature for creativity (lower for more predictable results)
         temperature: 0.3,
       },
-       // Add output format specifier if needed (though less critical for image gen)
-      output: { format: 'json' } // Requesting JSON might help structure other potential outputs, though image is primary
+      // Removed unsupported output format specifier for this model
+      // output: { format: 'json' }
     });
 
     const enhancedPhotoDataUri = media?.url;
@@ -147,4 +147,4 @@ const generateEnhancementJourneyFlow = ai.defineFlow(
 // Note: The actual image manipulation is now handled by the AI model based on the prompt.
 // The 'enhancementSteps' are generated separately based on the input parameters to provide textual feedback.
 
-    
+

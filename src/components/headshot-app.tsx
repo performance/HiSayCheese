@@ -219,12 +219,16 @@ export default function HeadshotApp() {
     setShowBeforeAfter(false);
     setEnhancementJourney(null);
     setSuggestionRationale(null);
+    // Do not apply client side filter for suggested enhancements immediately
+    // setUploadedImage(originalImage); 
+    // setUploadedImageIsAiEnhanced(false);
 
     try {
       const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: originalImage });
       const animationDurationPerSlider = 400;
       setSuggestionRationale(suggestions.rationale);
 
+      // Animate sliders to suggested values
       await animateSlider('brightness', suggestions.brightness, animationDurationPerSlider);
       await animateSlider('contrast', suggestions.contrast, animationDurationPerSlider);
       await animateSlider('saturation', suggestions.saturation, animationDurationPerSlider);
@@ -233,7 +237,7 @@ export default function HeadshotApp() {
 
       toast({
         title: "AI Suggestions Loaded",
-        description: "Sliders animated to suggested values. Hover over (i) for rationale. Click 'Apply AI' to see changes.",
+        description: "Sliders animated to suggested values. Hover over (i) for rationale. Click 'Apply AI' to see changes on the image.",
       });
     } catch (error) {
       console.error("Error suggesting enhancements:", error);
@@ -265,27 +269,25 @@ export default function HeadshotApp() {
        imageContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
      }
     
-    const animationDurationPerSlider = 300; 
+    // Use current slider values for enhancement
     const currentSettings = {...enhancementValues}; 
 
-    await animateSlider('brightness', currentSettings.brightness, animationDurationPerSlider);
-    await animateSlider('contrast', currentSettings.contrast, animationDurationPerSlider);
-    await animateSlider('saturation', currentSettings.saturation, animationDurationPerSlider);
-    await animateSlider('backgroundBlur', currentSettings.backgroundBlur, animationDurationPerSlider);
-    await animateSlider('faceSmoothing', currentSettings.faceSmoothing, animationDurationPerSlider);
-
+    // Animate sliders to ensure they reflect current settings during processing (visual feedback)
+    // No need to re-animate sliders if they are already at currentSettings
+    // This section can be simplified if sliders already reflect enhancementValues.
+    // The primary goal here is to trigger the AI enhancement with current values.
 
      try {
        const journeyResult = await generateEnhancementJourney({
          photoDataUri: originalImage, 
-         ...currentSettings, 
+         ...currentSettings, // Use current slider values
        });
        setUploadedImage(journeyResult.enhancedPhotoDataUri);
        setEnhancementJourney(journeyResult);
        setUploadedImageIsAiEnhanced(true); 
        toast({
          title: "Enhancement Applied",
-         description: "Image enhanced by AI using current settings. See journey steps.",
+         description: "Image enhanced by AI using current settings. See journey steps below.",
        });
      } catch (error) {
        console.error("Error applying enhancement journey:", error);
@@ -305,15 +307,20 @@ export default function HeadshotApp() {
       if (!originalImage || !uploadedImage) return; 
      
       if (showBeforeAfter) { 
-        setUploadedImage(enhancementJourney?.enhancedPhotoDataUri || originalImage); 
+        // If currently showing original, switch to AI enhanced (if available) or latest client-side preview
+        setUploadedImage(enhancementJourney?.enhancedPhotoDataUri || uploadedImage); 
         setShowBeforeAfter(false);
       } else { 
+        // If currently showing enhanced/preview, switch to original
+        // No need to change uploadedImage here, as it's used by getImageStyle for original
         setShowBeforeAfter(true);
       }
    }
   
    const getImageStyle = (): React.CSSProperties => {
+     // If showing 'before' (original), or if an AI-enhanced image is currently set, don't apply client-side filters.
      if (showBeforeAfter || uploadedImageIsAiEnhanced) return {};
+     // Otherwise, apply client-side filters based on slider values for preview.
      return {
        filter: `
          brightness(${1 + (enhancementValues.brightness - 0.5) * 1})
@@ -321,6 +328,8 @@ export default function HeadshotApp() {
          saturate(${1 + (enhancementValues.saturation - 0.5) * 1})
          blur(${(enhancementValues.backgroundBlur * 5)}px)
        `,
+       // Note: Face smoothing is harder to preview client-side accurately without ML.
+       // It will only be visible on the AI-enhanced image.
      };
    };
 
@@ -355,7 +364,7 @@ export default function HeadshotApp() {
       <TooltipProvider>
         <Tooltip delayDuration={100}>
           <TooltipTrigger asChild>
-            <div className="flex flex-col items-center text-center p-2 rounded-md hover:bg-accent/50 transition-colors">
+            <div className="flex flex-col items-center text-center p-2 rounded-md hover:bg-accent/10 transition-colors cursor-default">
               <Icon className={`w-8 h-8 mb-1 ${lowIsGood && score > (outOf * 0.6) ? 'text-destructive' : (score < (outOf * 0.4) && !lowIsGood ? 'text-destructive' : 'text-muted-foreground')}`} />
               <span className={`font-semibold text-sm ${scoreColorClass}`}>{displayScore}</span>
             </div>
@@ -406,10 +415,10 @@ export default function HeadshotApp() {
         </div>
       </header>
 
-      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]">
+      <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]"> {/* 8rem = header + footer height approx */}
         <div
             ref={imageContainerRef}
-            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full"
+            className="lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[300px] lg:min-h-0 h-full" // h-full for vertical fill
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -423,7 +432,7 @@ export default function HeadshotApp() {
                 style={{ objectFit: 'contain', ...getImageStyle() }}
                 className="transition-all duration-300"
                 data-ai-hint="professional headshot"
-                priority
+                priority // Prioritize loading of the main image
               />
                {originalImage && uploadedImage && uploadedImageIsAiEnhanced && (
                  <Button
@@ -471,13 +480,14 @@ export default function HeadshotApp() {
           )}
         </div>
 
-        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full">
+        {/* Controls Column */}
+        <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full"> {/* h-full for vertical fill */}
           {/* Image Quality Assessment Panel */}
           <Card className="flex-shrink-0">
             <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
             <CardContent>
               {isAssessingQuality && !imageQualityAssessment && (
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-4 gap-2"> {/* Changed to 4 columns */}
                   <Skeleton className="h-20 w-full" />
                   <Skeleton className="h-20 w-full" />
                   <Skeleton className="h-20 w-full" />
@@ -489,7 +499,7 @@ export default function HeadshotApp() {
               )}
               {imageQualityAssessment && (
                 <>
-                <div className="grid grid-cols-2 gap-x-2 gap-y-4">
+                <div className="grid grid-cols-4 gap-2"> {/* Changed to 4 columns, consistent gap */}
                   <QualityScoreIcon label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
                   <QualityScoreIcon label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
                   <QualityScoreIcon label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
@@ -579,7 +589,7 @@ export default function HeadshotApp() {
         </div>
       </main>
 
-      <footer className="bg-card border-t mt-auto flex-shrink-0">
+      <footer className="bg-card border-t mt-auto flex-shrink-0"> {/* mt-auto pushes footer to bottom if content is short */}
         <div className="container mx-auto px-4 py-3 text-center text-muted-foreground text-xs">
           &copy; {new Date().getFullYear()} Headshot Handcrafter. All rights reserved.
         </div>

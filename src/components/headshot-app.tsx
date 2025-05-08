@@ -2,7 +2,7 @@
 
 import type { ChangeEvent } from 'react';
 import ImageUpload from './image-upload';
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, ChangeEventHandler } from 'react';
 import Image from 'next/image';
 import { Slider } from '@/components/ui/slider';
 import { Button } from '@/components/ui/button';
@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useToast } from '@/hooks/use-toast';
 import { suggestEnhancements, SuggestEnhancementsOutput } from '@/ai/flows/suggest-enhancements';
 import { generateEnhancementJourney, GenerateEnhancementJourneyOutput } from '@/ai/flows/virtual-enhancement-journey';
+import { Checkbox } from '@/components/ui/checkbox';
 import { assessImageQuality, ImageQualityAssessmentOutput } from '@/ai/flows/image-quality-assessment';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -69,36 +70,37 @@ export default function HeadshotApp() {
   const [carouselSlides, setCarouselSlides] = useState<CarouselSlide[]>([]);
   const [isAssessingQuality, setIsAssessingQuality] = useState(false);
 
+  const [isTestMode, setIsTestMode] = useState<boolean>(false);
   const [carouselApi, setCarouselApi] = useState<CarouselApi>();
     const [currentSlide, setCurrentSlide] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Effect to set initial state on client-side
-  useEffect(() => {
+    useEffect(() => {
+        if (isTestMode) {
+            const generatedTestImages = generateTestImages();
+            setTestImages(generatedTestImages);
+            // Randomly select a test image only on the client-side
+            const randomIndex = Math.floor(Math.random() * generatedTestImages.length);
+            const randomTestImage = generatedTestImages[randomIndex];
 
-    const generatedTestImages = generateTestImages();
-    setTestImages(generatedTestImages);
-    // Randomly select a test image only on the client-side
-    const randomIndex = Math.floor(Math.random() * generatedTestImages.length);
-    const randomTestImage = generatedTestImages[randomIndex];
-    
-    setSelectedTestImage(randomTestImage);
-    setOriginalImage(randomTestImage.url); 
-    setUploadedImage(randomTestImage.url);
+            setSelectedTestImage(randomTestImage);
+            setOriginalImage(randomTestImage.url);
+            setUploadedImage(randomTestImage.url);
 
-    setImageQualityAssessment({
-      feedback: [] as string[],
-      overallSuitabilityScore: randomTestImage.overallQualityScore, 
-      frontFacingScore: randomTestImage.qualityScores.frontFacingPose,
-      eyeVisibilityScore: randomTestImage.qualityScores.eyeVisibility,
-      lightingQualityScore: randomTestImage.qualityScores.lightingQuality,
-      focusSharpnessScore: randomTestImage.qualityScores.focusSharpness,
-      backgroundAppropriatenessScore: randomTestImage.qualityScores.backgroundAppropriateness,
-      expressionAppropriatenessScore: randomTestImage.qualityScores.expressionAppropriateness,
-      headToBodyRatioScore: 0.5, // Placeholder value
-      obstructionScore: randomTestImage.qualityScores.obstructions,
-
-    });
+            setImageQualityAssessment({
+                feedback: [] as string[],
+                overallSuitabilityScore: randomTestImage.overallQualityScore,
+                frontFacingScore: randomTestImage.qualityScores.frontFacingPose,
+                eyeVisibilityScore: randomTestImage.qualityScores.eyeVisibility,
+                lightingQualityScore: randomTestImage.qualityScores.lightingQuality,
+                focusSharpnessScore: randomTestImage.qualityScores.focusSharpness,
+                backgroundAppropriatenessScore: randomTestImage.qualityScores.backgroundAppropriateness,
+                expressionAppropriatenessScore: randomTestImage.qualityScores.expressionAppropriateness,
+                headToBodyRatioScore: 0.5, // Placeholder value
+                obstructionScore: randomTestImage.qualityScores.obstructions,
+            });
+        }
     
       setTimeout(() => setIsClient(true), 10);
   }, []);
@@ -553,6 +555,10 @@ export default function HeadshotApp() {
             <h1 className="text-2xl font-bold text-primary">Headshot Handcrafter</h1>
           </div>
           <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                  <Checkbox id="test-mode" onCheckedChange={setIsTestMode} />
+                  <Label htmlFor="test-mode">Test Mode</Label>
+              </div>
             <Select onValueChange={setMode}>
               <SelectTrigger className="w-[180px]">
                 <SelectValue placeholder="Select a Mode" />
@@ -584,7 +590,7 @@ export default function HeadshotApp() {
         </div>
       </header>
       <main className="flex-grow container mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 overflow-hidden max-h-[calc(100vh-8rem)]">
-        {!originalImage ? (
+          {(!isTestMode && !originalImage) ? (
           <div className="overflow-y-auto lg:col-span-2 flex flex-col items-center justify-center p-4 relative bg-card rounded-lg border shadow-sm overflow-hidden min-h-[calc(100vh-16rem)] h-full"
           > <ImageUpload
                 handleImageUpload={handleImageUpload}

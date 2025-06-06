@@ -25,6 +25,7 @@ from typing import List # Added for FaceDetection models
 
 from services.face_detection import detect_faces # Added for face detection endpoint
 from services.image_quality import analyze_image_quality # New import
+from services.auto_enhancement import calculate_auto_enhancements # New import for auto enhancement
 
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
@@ -49,6 +50,20 @@ class ImageQualityAnalysisResponse(BaseModel):
     image_id: uuid.UUID
     quality_metrics: ImageQualityMetrics
     insights: List[str]
+    message: Optional[str] = None
+
+# Pydantic models for Image Enhancement
+class EnhancementParameters(BaseModel):
+    brightness_target: float
+    contrast_target: float
+    saturation_target: float
+    background_blur_radius: int
+    crop_rect: List[int]  # [x, y, width, height]
+    face_smooth_intensity: float
+
+class AutoEnhancementResponse(BaseModel):
+    image_id: uuid.UUID
+    enhancement_parameters: EnhancementParameters
     message: Optional[str] = None
 
 app = FastAPI()
@@ -435,3 +450,86 @@ async def get_image_quality_analysis(image_id: uuid.UUID, db: Session = Depends(
     except Exception as e:
         logger.error(f"An unexpected error occurred while analyzing image quality for id {image_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during image quality analysis.")
+
+
+@app.get("/api/enhancement/auto/{image_id}", response_model=AutoEnhancementResponse)
+async def get_auto_enhancement_parameters(
+    image_id: uuid.UUID,
+    mode: Optional[str] = None, # Allows for different enhancement modes e.g. "passport"
+    db: Session = Depends(get_db)
+):
+    logger.info(f"Received request for auto enhancement parameters for image_id: {image_id}, mode: {mode}")
+
+    db_image = crud.get_image(db, image_id=image_id)
+    if not db_image:
+        logger.warning(f"Image not found in DB for id: {image_id}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image with id {image_id} not found.")
+
+    if not db_image.filepath:
+        logger.warning(f"Filepath not available for image_id: {image_id}. Image status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Filepath for image id {image_id} not available. Image may not have been processed or saved.")
+
+    if not os.path.exists(db_image.filepath):
+        logger.error(f"Image file not found at path: {db_image.filepath} for image_id: {image_id}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image file not found at path {db_image.filepath}. It may have been moved or deleted.")
+
+    if db_image.width is None or db_image.height is None:
+        logger.error(f"Image dimensions are missing for image_id: {image_id}. Width: {db_image.width}, Height: {db_image.height}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Image dimensions (width, height) missing for image id {image_id}. Cannot perform enhancements.")
+    image_dimensions = (db_image.width, db_image.height)
+
+    face_results = []
+    try:
+        logger.info(f"Performing face detection for image_id: {image_id} at path: {db_image.filepath}")
+        face_results = detect_faces(db_image.filepath) # Returns a list of dicts
+    except FileNotFoundError: # Should be caught by os.path.exists, but good as a safeguard
+        logger.error(f"Face detection: File not found for image_id: {image_id} at path: {db_image.filepath}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image file not found during face detection for id {image_id}.")
+    except ValueError as e: # If detect_faces raises ValueError for bad image
+        logger.error(f"Face detection: Error processing image_id {image_id} (ValueError): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing image for face detection (id: {image_id}): {str(e)}")
+    except Exception as e:
+        logger.error(f"Face detection: Unexpected error for image_id {image_id}: {e}", exc_info=True)
+        # Depending on policy, we might allow proceeding without face_results or raise 500.
+        # For now, let's proceed, calculate_auto_enhancements should handle empty face_results.
+        # If it's critical, raise HTTPException here. For now, it defaults to empty list.
+        pass # Proceed with empty face_results
+
+    quality_results = {}
+    try:
+        logger.info(f"Performing image quality analysis for image_id: {image_id} at path: {db_image.filepath}")
+        quality_results = analyze_image_quality(db_image.filepath) # Returns a dict
+    except FileNotFoundError: # Should be caught by os.path.exists
+        logger.error(f"Quality analysis: File not found for image_id: {image_id} at path: {db_image.filepath}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image file not found during quality analysis for id {image_id}.")
+    except ValueError as e: # If analyze_image_quality raises ValueError for bad image
+        logger.error(f"Quality analysis: Error processing image_id {image_id} (ValueError): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing image for quality analysis (id: {image_id}): {str(e)}")
+    except Exception as e:
+        logger.error(f"Quality analysis: Unexpected error for image_id {image_id}: {e}", exc_info=True)
+        # If quality_results are essential and cannot be defaulted in calculate_auto_enhancements, raise 500.
+        # calculate_auto_enhancements has defaults if keys are missing.
+        # So, we can proceed with potentially empty quality_results or partial data.
+        pass # Proceed with potentially empty/partial quality_results
+
+
+    logger.info(f"Calculating auto enhancement parameters for image_id: {image_id} with mode: {mode}")
+    try:
+        enhancement_params_dict = calculate_auto_enhancements(
+            image_path=db_image.filepath,
+            image_dimensions=image_dimensions,
+            face_detection_results=face_results,
+            image_quality_results=quality_results,
+            mode=mode
+        )
+        enhancement_params_model = EnhancementParameters(**enhancement_params_dict)
+
+        logger.info(f"Successfully calculated enhancement parameters for image_id: {image_id}")
+        return AutoEnhancementResponse(
+            image_id=image_id,
+            enhancement_parameters=enhancement_params_model,
+            message="Auto enhancement parameters calculated successfully."
+        )
+    except Exception as e:
+        logger.error(f"Error calculating auto enhancement parameters for image_id {image_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate auto enhancement parameters due to an internal error.")

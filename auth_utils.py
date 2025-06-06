@@ -74,4 +74,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             detail="User not found",
             headers={"WWW-Authenticate": "Bearer"}
         )
+
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified. Please check your email for a verification link.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return user

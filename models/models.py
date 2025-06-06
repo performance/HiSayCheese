@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 import re
 
-from sqlalchemy import Column, DateTime, Integer, String, ForeignKey, Index
+from sqlalchemy import Column, DateTime, Integer, String, ForeignKey, Index, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
 from pydantic import BaseModel, EmailStr, conint, constr, validator
@@ -46,6 +46,9 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    is_verified = Column(Boolean, default=False, nullable=False)
+    verification_token = Column(String, nullable=True, index=True, unique=True)
+    verification_token_expires_at = Column(DateTime, nullable=True)
 
 
 # Pydantic schemas for User
@@ -70,6 +73,7 @@ class UserCreate(UserBase):
 class UserSchema(UserBase):
     id: uuid.UUID
     created_at: datetime
+    is_verified: bool # Added is_verified field
 
     class Config:
         orm_mode = True

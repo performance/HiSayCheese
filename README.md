@@ -151,6 +151,33 @@ When images are uploaded or processed, API endpoints that return image locations
 
 For local development and testing, S3 interactions are typically mocked (e.g., using `moto` as implemented in the project's tests). When running the application locally with such mocks, you might still need to set the S3-related environment variables (e.g., `AWS_S3_BUCKET_NAME`, `AWS_S3_REGION`, and dummy credentials like `AWS_ACCESS_KEY_ID="testing"`, `AWS_SECRET_ACCESS_KEY="testing"`) for the `StorageService` to initialize correctly, even though `moto` will intercept the actual S3 calls. Refer to `config.py` for how these are loaded and for any default fallback values (though for credentials, real or mock values via environment variables are expected for S3 functionality).
 
+### AWS SES for Email Sending
+
+The application uses AWS Simple Email Service (SES) for sending transactional emails, such as account verification emails.
+
+**Required Environment Variables:**
+
+*   `AWS_SES_REGION`: The AWS region where your SES service is configured (e.g., `us-east-1`). This can often be the same as your S3 region.
+*   `AWS_SES_SENDER_EMAIL`: The email address that will appear as the sender (e.g., `noreply@hisaycheese.com`). **This email address must be verified in your AWS SES console for the specified region.**
+*   `FRONTEND_URL`: The base URL of your frontend application (e.g., `http://localhost:3000` or `https://hisaycheese.com`). This is used to generate links in emails, such as the verification link.
+
+The existing AWS credentials (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`) configured for S3 are also used by `boto3` for SES, assuming the IAM permissions are correctly set up. These settings are loaded by `config.py`.
+
+**Local Development with SES Mocking:**
+
+Similar to S3, SES calls are mocked using `moto` during automated tests. For local manual testing where you might not want to send real emails, ensure the application can handle the `EmailService` potentially not sending emails (e.g., if credentials aren't fully set up or the service is conditionally disabled). The `FRONTEND_URL` should be set appropriately in your local environment if you intend to click generated links that point to your local frontend instance.
+
+## User Account Verification
+
+New users registering with HiSayCheese will need to verify their email address to fully activate their account and access all features.
+
+1.  **Registration:** Upon successful registration, the system automatically sends a verification email to the address provided. This email is sent asynchronously to ensure a fast response from the registration API endpoint.
+2.  **Verification Email:** The email contains a unique, time-sensitive verification link.
+3.  **Verification Process:** Clicking this link directs the user to an API endpoint (`GET /api/auth/verify-email?token=<token>`) that validates the token.
+4.  **Access Granted:** If the token is valid and not expired, the user's email is marked as verified in the database. They can then log in and access all protected API resources and application features. If the token is invalid or expired, an appropriate error message is displayed.
+
+Until the email is verified, access to certain protected API endpoints will be restricted.
+
 ## Project Naming
 
 *   **Primary Name:** HiSayCheese (utilizing the owned domain `HiSayCheese.com`)

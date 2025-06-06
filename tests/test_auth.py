@@ -554,3 +554,220 @@ def test_login_incorrect_password(db_session: Session):
 # Ideally, project structure and PYTHONPATH should be set up so this isn't strictly necessary,
 # e.g., by installing the package in editable mode (`pip install -e .`) or configuring the test runner.
 # Running `pytest` from the project root directory is usually the best practice.
+
+# --- Imports for Email Verification Tests ---
+from moto import mock_ses
+from unittest.mock import patch
+from config import FRONTEND_URL # For checking email link construction
+from datetime import datetime, timedelta # For manipulating token expiry
+from models.models import UserSchema # For response model validation if needed
+
+# --- Test Cases for Email Verification Flow ---
+
+# Set mock AWS environment variables for SES for all tests in this module/file
+# These will be active when moto's @mock_ses is used.
+MOCK_AWS_SES_REGION = "us-east-1" # Can be same as S3 or different
+MOCK_AWS_SES_SENDER_EMAIL = "test_sender@example.com"
+MOCK_FRONTEND_URL = "http://testfrontend.com"
+
+original_env = {}
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_ses_env_vars():
+    global original_env
+    env_vars_to_set = {
+        "AWS_SES_REGION": MOCK_AWS_SES_REGION,
+        "AWS_SES_SENDER_EMAIL": MOCK_AWS_SES_SENDER_EMAIL,
+        "FRONTEND_URL": MOCK_FRONTEND_URL,
+        # Assuming AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set by
+        # a global fixture like setup_test_environment in test_main.py,
+        # or moto will use its defaults. If not, set them here too:
+        "AWS_ACCESS_KEY_ID": "testing_auth",
+        "AWS_SECRET_ACCESS_KEY": "testing_auth",
+    }
+    for key, value in env_vars_to_set.items():
+        original_env[key] = os.environ.get(key)
+        os.environ[key] = value
+
+    yield
+
+    for key, value in original_env.items():
+        if value is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = value
+    original_env.clear()
+
+
+@mock_ses # Moto decorator for mocking SES
+def test_register_user_sends_verification_email(db_session: Session):
+    unique_email = f"test_email_verif_{uuid.uuid4()}@example.com"
+    password = "validpassword123"
+
+    # Patch the actual send_email method of the EmailService instance
+    with patch('services.email_service.EmailService.send_email', return_value="mock_message_id") as mock_send_email:
+        response = client.post(
+            "/api/auth/register",
+            json={"email": unique_email, "password": password},
+        )
+
+    assert response.status_code == 201, response.text
+    data = response.json()
+    assert data["email"] == unique_email
+    assert data["is_verified"] is False # Check new field
+
+    # Verify in DB
+    user_in_db = db_session.query(UserModel).filter(UserModel.email == unique_email).first()
+    assert user_in_db is not None
+    assert user_in_db.is_verified is False
+    assert user_in_db.verification_token is not None
+    assert user_in_db.verification_token_expires_at is not None
+    assert user_in_db.verification_token_expires_at > datetime.utcnow()
+
+    # Assert that send_email was called
+    mock_send_email.assert_called_once()
+    call_args = mock_send_email.call_args[1] # Get keyword arguments
+    assert call_args['to_address'] == unique_email
+    assert "Verify your account" in call_args['subject'] # Check subject contains expected phrase
+
+    # Check if verification link in HTML body is correct
+    expected_verification_link_part = f"{MOCK_FRONTEND_URL}/auth/verify-email?token={user_in_db.verification_token}"
+    assert expected_verification_link_part in call_args['html_body']
+    assert expected_verification_link_part in call_args['text_body']
+
+
+    # Cleanup
+    clear_user_from_db(db_session, unique_email)
+
+
+@mock_ses
+def test_verify_email_valid_token(db_session: Session):
+    # 1. Register user (email sending is mocked by default if not patched here)
+    user_email = f"verify_valid_{uuid.uuid4()}@example.com"
+    password = "ValidPassword1!"
+
+    with patch('services.email_service.EmailService.send_email'): # Mock to prevent actual send
+        reg_response = client.post("/api/auth/register", json={"email": user_email, "password": password})
+    assert reg_response.status_code == 201
+
+    user_in_db = db_session.query(UserModel).filter(UserModel.email == user_email).first()
+    assert user_in_db is not None
+    verification_token = user_in_db.verification_token
+    assert verification_token is not None
+    assert user_in_db.is_verified is False
+
+    # 2. Call /verify-email with the token
+    verify_response = client.get(f"/api/auth/verify-email?token={verification_token}")
+    assert verify_response.status_code == 200, verify_response.text
+    verify_data = verify_response.json()
+    assert verify_data["email"] == user_email
+    assert verify_data["is_verified"] is True
+
+    # 3. Check DB state
+    db_session.refresh(user_in_db) # Refresh from DB
+    assert user_in_db.is_verified is True
+    assert user_in_db.verification_token is None # Token should be cleared
+    assert user_in_db.verification_token_expires_at is None
+
+    clear_user_from_db(db_session, user_email)
+
+
+@mock_ses
+def test_verify_email_invalid_token(db_session: Session):
+    response = client.get(f"/api/auth/verify-email?token=thisisafaketoken123")
+    assert response.status_code == 400, response.text
+    assert "Invalid or expired verification token" in response.json()["detail"]
+
+@mock_ses
+def test_verify_email_expired_token(db_session: Session):
+    user_email = f"verify_expired_{uuid.uuid4()}@example.com"
+    password = "ValidPassword1!"
+    with patch('services.email_service.EmailService.send_email'):
+        client.post("/api/auth/register", json={"email": user_email, "password": password})
+
+    user_in_db = db_session.query(UserModel).filter(UserModel.email == user_email).first()
+    assert user_in_db is not None
+    verification_token = user_in_db.verification_token
+
+    # Manually expire the token in DB
+    user_in_db.verification_token_expires_at = datetime.utcnow() - timedelta(hours=1)
+    db_session.commit()
+
+    response = client.get(f"/api/auth/verify-email?token={verification_token}")
+    assert response.status_code == 400, response.text
+    assert "Verification token has expired" in response.json()["detail"]
+
+    clear_user_from_db(db_session, user_email)
+
+@mock_ses
+def test_verify_email_already_verified_or_used_token(db_session: Session):
+    user_email = f"verify_used_{uuid.uuid4()}@example.com"
+    password = "ValidPassword1!"
+    with patch('services.email_service.EmailService.send_email'):
+        client.post("/api/auth/register", json={"email": user_email, "password": password})
+
+    user_in_db = db_session.query(UserModel).filter(UserModel.email == user_email).first()
+    verification_token = user_in_db.verification_token
+
+    # First verification attempt (should succeed)
+    client.get(f"/api/auth/verify-email?token={verification_token}")
+    db_session.refresh(user_in_db)
+    assert user_in_db.is_verified is True
+    assert user_in_db.verification_token is None # Token is cleared
+
+    # Attempt to use the same token again (or any token if user is already verified)
+    # If token was cleared, get_user_by_verification_token will return None.
+    # If we try with an old token string, and the user is already verified.
+    response = client.get(f"/api/auth/verify-email?token={verification_token}") # Token is now invalid as it's cleared
+    assert response.status_code == 400, response.text
+    assert "Invalid or expired verification token" in response.json()["detail"] # Because token is None in DB
+
+    # Test case where user is already verified but somehow a different valid token is used (less likely)
+    # This is covered by the user.is_verified check in the endpoint.
+    # To test that specific branch: manually set user to verified but with a valid token still there.
+    user_in_db.is_verified = True
+    user_in_db.verification_token = "still_valid_token_for_test"
+    user_in_db.verification_token_expires_at = datetime.utcnow() + timedelta(hours=1)
+    db_session.commit()
+    response_already_verified = client.get(f"/api/auth/verify-email?token=still_valid_token_for_test")
+    assert response_already_verified.status_code == 400, response_already_verified.text
+    assert "Email already verified or token invalid" in response_already_verified.json()["detail"]
+
+    clear_user_from_db(db_session, user_email)
+
+
+@mock_ses
+def test_access_protected_route_unverified_vs_verified(db_session: Session):
+    user_email = f"access_ctrl_{uuid.uuid4()}@example.com"
+    password = "ValidPassword1!"
+
+    # 1. Register user (mock email sending)
+    with patch('services.email_service.EmailService.send_email'):
+        reg_response = client.post("/api/auth/register", json={"email": user_email, "password": password})
+    assert reg_response.status_code == 201
+    user_data_from_reg = reg_response.json()
+    verification_token = db_session.query(UserModel).filter_by(email=user_email).first().verification_token
+
+    # 2. Login to get token
+    login_response = client.post("/api/auth/login", data={"username": user_email, "password": password})
+    assert login_response.status_code == 200
+    access_token = login_response.json()["access_token"]
+    auth_headers = {"Authorization": f"Bearer {access_token}"}
+
+    # 3. Attempt to access /api/users/me (protected) - should fail (403)
+    me_response_unverified = client.get("/api/users/me", headers=auth_headers)
+    assert me_response_unverified.status_code == 403, me_response_unverified.text
+    assert "Email not verified" in me_response_unverified.json()["detail"]
+
+    # 4. Verify email
+    verify_response = client.get(f"/api/auth/verify-email?token={verification_token}")
+    assert verify_response.status_code == 200, f"Verification failed: {verify_response.text}"
+
+    # 5. Attempt to access /api/users/me again - should succeed (200)
+    # The existing token should now work as the user's 'is_verified' status is updated in DB.
+    me_response_verified = client.get("/api/users/me", headers=auth_headers)
+    assert me_response_verified.status_code == 200, me_response_verified.text
+    assert me_response_verified.json()["email"] == user_email
+    assert me_response_verified.json()["is_verified"] is True # UserSchema from /me should show this
+
+    clear_user_from_db(db_session, user_email)

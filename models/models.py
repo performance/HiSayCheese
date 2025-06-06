@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import Column, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
@@ -22,6 +23,7 @@ class Image(Base):
     filepath = Column(String)
     filesize = Column(Integer)
     mimetype = Column(String)
+    rejection_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class NumberBase(BaseModel):
@@ -42,11 +44,13 @@ class ImageCreate(BaseModel):
     filepath: str
     filesize: int
     mimetype: str
+    rejection_reason: Optional[str] = None
 
 # Pydantic schema for reading/returning an Image
 class ImageSchema(ImageCreate): # Inherits fields from ImageCreate
     id: uuid.UUID
     created_at: datetime
+    rejection_reason: Optional[str] = None
 
     class Config:
         orm_mode = True

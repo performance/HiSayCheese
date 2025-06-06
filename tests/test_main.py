@@ -455,6 +455,63 @@ def mock_moderate_content_approve_fixture(mocker):
         return_value=ContentModerationResult(is_approved=True, rejection_reason=None)
     )
 
+# --- Helper for Advanced Rate Limit Tests ---
+import time # For rate limit reset tests
+
+# Assuming these constants are accessible from main or defined for tests
+try:
+    from main import ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT
+    ANON_REQUESTS_PER_WINDOW = int(ANON_USER_RATE_LIMIT.split('/')[0])
+    AUTH_REQUESTS_PER_WINDOW = int(AUTH_USER_RATE_LIMIT.split('/')[0])
+except ImportError:
+    ANON_REQUESTS_PER_WINDOW = 20 # Fallback, ensure matches main.py
+    AUTH_REQUESTS_PER_WINDOW = 100 # Fallback, ensure matches main.py
+
+def get_rate_limit_headers_from_response(response): # Renamed to avoid conflict with test_auth.py if merged
+    return {
+        "limit": response.headers.get("X-RateLimit-Limit"),
+        "remaining": response.headers.get("X-RateLimit-Remaining"),
+        "reset": response.headers.get("X-RateLimit-Reset"),
+    }
+
+# Helper to create a temporary user and get a token for authenticated tests
+def create_user_and_get_token(client_instance, db_session_instance, email_prefix="auth_test_user"):
+    user_email = f"{email_prefix}_{uuid.uuid4()}@example.com"
+    user_password = "ValidPasswordForTesting1!"
+
+    reg_response = client_instance.post(
+        "/api/auth/register",
+        json={"email": user_email, "password": user_password},
+    )
+    if reg_response.status_code != status.HTTP_201_CREATED:
+        # Try to clear if user somehow exists from a failed previous run
+        db = SessionLocal()
+        existing_user = db.query(models.User).filter(models.User.email == user_email).first()
+        if existing_user:
+            db.delete(existing_user)
+            db.commit()
+        db.close()
+        reg_response = client_instance.post( # Retry registration
+            "/api/auth/register", json={"email": user_email, "password": user_password}
+        )
+
+    assert reg_response.status_code == status.HTTP_201_CREATED, \
+        f"Failed to register user for token generation: {reg_response.text}"
+
+    login_response = client_instance.post(
+        "/api/auth/login",
+        data={"username": user_email, "password": user_password},
+    )
+    assert login_response.status_code == status.HTTP_200_OK, \
+        f"Failed to login user for token generation: {login_response.text}"
+
+    token = login_response.json()["access_token"]
+
+    # Store email for cleanup if needed, or rely on test-scoped DB fixtures
+    # For now, caller should handle cleanup or use appropriate DB fixtures.
+    return token, user_email
+
+
 # --- Security Headers Test ---
 def test_security_headers_present():
     response = client.get("/") # Any endpoint should have these headers
@@ -591,6 +648,175 @@ def test_put_number_out_of_range_negative():
 # For now, we'll skip direct SQLi/XSS tests on string fields in `test_main.py` as `upload_image`
 # doesn't take arbitrary JSON strings that are directly stored without sanitization of the field itself.
 # Filename sanitization is the key one for `upload_image`.
+
+
+# --- Advanced Rate Limiting Tests for Main Endpoints ---
+
+# 1. Differentiated Limits for /api/images/upload
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limiting_anonymous(client):
+    for i in range(ANON_REQUESTS_PER_WINDOW):
+        file_to_upload = create_dummy_file_for_upload(f"anon_upload_{i}.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        response = client.post("/api/images/upload", files={"file": file_to_upload})
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Anonymous upload attempt {i+1} rate limited prematurely.")
+        assert response.status_code == status.HTTP_201_CREATED # Assuming valid upload otherwise
+
+    # Next request should be rate limited
+    file_to_upload = create_dummy_file_for_upload("anon_upload_final.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == "0"
+
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limiting_authenticated(client, db_session): # Added db_session for user cleanup
+    token, user_email_for_cleanup = create_user_and_get_token(client, db_session, "upload_auth_rl")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        file_to_upload = create_dummy_file_for_upload(f"auth_upload_{i}.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        response = client.post("/api/images/upload", files={"file": file_to_upload}, headers=auth_headers)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Authenticated upload attempt {i+1} rate limited prematurely.")
+        assert response.status_code == status.HTTP_201_CREATED
+
+    # Next request should be rate limited
+    file_to_upload = create_dummy_file_for_upload("auth_upload_final.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload}, headers=auth_headers)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == "0"
+
+    # Cleanup created user
+    db = SessionLocal()
+    clear_user_from_db(db, user_email_for_cleanup) # Re-using clear_user_from_db from test_auth style
+    db.close()
+
+# 2. Rate Limit Headers for /api/images/upload
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limit_headers_anonymous_single_request(client):
+    file_to_upload = create_dummy_file_for_upload("header_test_anon.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response.status_code == status.HTTP_201_CREATED
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == str(ANON_REQUESTS_PER_WINDOW - 1)
+    assert headers["reset"] is not None
+    assert int(headers["reset"]) > time.time() - 5 # Reset time should be in the future (approx)
+
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limit_headers_authenticated_single_request(client, db_session):
+    token, user_email_for_cleanup = create_user_and_get_token(client, db_session, "upload_hdr_auth_rl")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    file_to_upload = create_dummy_file_for_upload("header_test_auth.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+
+    response = client.post("/api/images/upload", files={"file": file_to_upload}, headers=auth_headers)
+    assert response.status_code == status.HTTP_201_CREATED
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == str(AUTH_REQUESTS_PER_WINDOW - 1)
+    assert headers["reset"] is not None
+    assert int(headers["reset"]) > time.time() - 5
+
+    db = SessionLocal()
+    clear_user_from_db(db, user_email_for_cleanup)
+    db.close()
+
+# 3. Rate Limit Reset Test (using /api/images/upload anonymous)
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limit_reset_anonymous(client):
+    # Exceed limit
+    for i in range(ANON_REQUESTS_PER_WINDOW + 1):
+        file_to_upload = create_dummy_file_for_upload(f"reset_anon_upload_{i}.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        response = client.post("/api/images/upload", files={"file": file_to_upload})
+        if i == ANON_REQUESTS_PER_WINDOW:
+            assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            headers_429 = get_rate_limit_headers_from_response(response)
+            reset_time = int(headers_429["reset"])
+            current_time = int(time.time())
+            sleep_duration = max(0, reset_time - current_time) + 1
+            if sleep_duration > 65: # Safety for tests
+                pytest.skip(f"Reset time too far ({sleep_duration}s), skipping sleep.")
+            time.sleep(sleep_duration)
+
+    # Try again after waiting
+    file_to_upload = create_dummy_file_for_upload("reset_anon_upload_final.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response_after_reset = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response_after_reset.status_code == status.HTTP_201_CREATED
+    headers_after = get_rate_limit_headers_from_response(response_after_reset)
+    assert headers_after["remaining"] == str(ANON_REQUESTS_PER_WINDOW - 1)
+
+
+# 4. Basic Rate Limit Test for other new endpoints in main.py
+# We'll test one from each group (analysis, enhancement) anonymously.
+# These require an image_id. We must upload an image first (un-rate-limited for setup).
+# For these, we mock less and let the actual DB interaction for image creation happen.
+
+@pytest.fixture(scope="function")
+def uploaded_image_id(client):
+    # This fixture uploads an image (bypassing rate limits on *this specific upload* if needed,
+    # or assuming it fits within limits for test setup) and returns its ID.
+    # For simplicity, we assume this setup upload won't hit a limit itself.
+    # To make it truly isolated, one might need to temporarily disable rate limiting for setup,
+    # or use a pre-existing image ID if the test environment allows.
+
+    # Temporarily remove rate limit from upload for this setup call
+    # This is a bit hacky. A better way might be to have a test utility that directly adds to DB
+    # or a specific "setup" endpoint without limits.
+    # For now, we'll just hope this one request doesn't get limited itself.
+    img_bytes = create_dummy_image_bytes(10,10) # Small image
+    file_data = ("setup_image.jpg", io.BytesIO(img_bytes), "image/jpeg")
+
+    # We need to ensure the moderation passes for the setup image.
+    with patch("main.moderate_image_content", return_value=ContentModerationResult(is_approved=True, rejection_reason=None)):
+        response = client.post("/api/images/upload", files={"file": file_data})
+
+    assert response.status_code == status.HTTP_201_CREATED, f"Setup image upload failed: {response.text}"
+    return response.json()["id"]
+
+
+def test_analysis_faces_endpoint_rate_limited_anon(client, uploaded_image_id):
+    endpoint_url = f"/api/analysis/faces/{uploaded_image_id}"
+    for i in range(ANON_REQUESTS_PER_WINDOW):
+        response = client.get(endpoint_url)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Anonymous request {i+1} to {endpoint_url} rate limited prematurely.")
+        # This endpoint might 404 if image processing fails or file not found by underlying service,
+        # but we are testing rate limiting primarily. A 200 or 404 is fine as long as not 429 yet.
+        assert response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+
+    response = client.get(endpoint_url)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+def test_enhancement_apply_endpoint_rate_limited_auth(client, uploaded_image_id, db_session):
+    token, user_email_for_cleanup = create_user_and_get_token(client, db_session, "enh_apply_rl")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    endpoint_url = "/api/enhancement/apply"
+    # Dummy params that should pass Pydantic validation for EnhancementRequest
+    enhancement_params = {
+        "brightness_target": 1.1, "contrast_target": 1.1, "saturation_target": 1.1,
+        "background_blur_radius": 0, "crop_rect": [0,0,10,10], "face_smooth_intensity": 0.0
+    }
+    request_body = {"image_id": uploaded_image_id, "parameters": enhancement_params}
+
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        response = client.post(endpoint_url, json=request_body, headers=auth_headers)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Authenticated request {i+1} to {endpoint_url} rate limited prematurely.")
+        # Other status codes (e.g., 200 if processing works, or 500 if image file is missing for processing by this point)
+        # are acceptable as long as it's not 429 yet.
+        assert response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+
+    response = client.post(endpoint_url, json=request_body, headers=auth_headers)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+    db = SessionLocal()
+    clear_user_from_db(db, user_email_for_cleanup)
+    db.close()
+
 
 @pytest.fixture
 def mock_file_system_operations_fixture(mocker):

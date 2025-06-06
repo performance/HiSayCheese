@@ -23,9 +23,14 @@ from starlette.types import ASGIApp # Added for middleware
 
 # Rate Limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.models import Limit # For parsing rate limit strings
+from slowapi.util import parse_many # To parse rate limit strings like "100/minute"
+
 from fastapi.responses import JSONResponse # For the exception handler
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+from config import SECRET_KEY, ALGORITHM # For decoding JWT
 
 from db.database import create_db_and_tables, get_db
 from db import crud
@@ -171,24 +176,160 @@ class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         return response
 
-# Initialize Limiter
-limiter = Limiter(key_func=get_remote_address)
+# Optional Bearer token scheme for rate limiter key function
+oauth2_scheme_optional = HTTPBearer(auto_error=False)
+
+# Define rate limit strings
+AUTH_USER_RATE_LIMIT = "100/minute"
+ANON_USER_RATE_LIMIT = "20/minute"
+
+# New key function for rate limiting (modified to add prefixes)
+# This is the corrected and single version of this function.
+def get_request_identifier_for_rate_limit(request: Request, creds: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme_optional)) -> str:
+    identifier_type = "ip" # To help with logging prefix
+    identifier = request.client.host
+    try:
+        if creds and creds.credentials:
+            token = creds.credentials
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("user_id")
+            if user_id:
+                identifier = str(user_id)
+                identifier_type = "user"
+                # logger.debug(f"Rate limiting by user_id: {identifier}") # Covered by prefix log
+            else:
+                sub = payload.get("sub")
+                if sub:
+                    identifier = str(sub)
+                    identifier_type = "sub"
+                    # logger.debug(f"Rate limiting by token subject (sub): {identifier}") # Covered by prefix log
+                else:
+                    logger.warning("Token present but no 'user_id' or 'sub' claim found. Falling back to IP.")
+            return f"{identifier_type}:{identifier}"
+    except JWTError as e:
+        logger.warning(f"JWTError during token decoding for rate limit key: {e}. Falling back to IP.")
+    except Exception as e:
+        logger.error(f"Unexpected error in get_request_identifier_for_rate_limit: {e}. Falling back to IP.")
+
+    # Fallback to IP if token processing failed or no token
+    key = f"ip:{request.client.host}"
+    request.state.rate_limit_key = key # Store for header middleware
+    logger.debug(f"Rate limiting by {key} for request to {request.url.path}")
+    return key
+
+
+# Function to get dynamic rate limit based on key prefix
+def get_dynamic_rate_limit(key: str) -> str:
+    if key.startswith("user:") or key.startswith("sub:"):
+        logger.debug(f"Applying authenticated user rate limit for key: {key}")
+        return AUTH_USER_RATE_LIMIT
+    else: # Starts with "ip:" or is an unexpected format (default to anon)
+        if not key.startswith("ip:"):
+            logger.warning(f"Unexpected key format '{key}' for dynamic rate limit, applying anonymous limit.")
+        logger.debug(f"Applying anonymous user rate limit for key: {key}")
+        return ANON_USER_RATE_LIMIT
+
+# Initialize Limiter with the new key function
+limiter = Limiter(key_func=get_request_identifier_for_rate_limit)
+
+# Middleware for adding X-RateLimit headers
+class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse:
+        response = await call_next(request)
+
+        key = getattr(request.state, 'rate_limit_key', None)
+
+        # Only add headers if the key was set (meaning a rate-limited route was hit)
+        # And if the app.state.limiter is available (it should be)
+        if key and hasattr(request.app.state, 'limiter'):
+            try:
+                limiter_instance: Limiter = request.app.state.limiter
+
+                # Determine the rate limit string dynamically for this key
+                # This assumes that get_dynamic_rate_limit is accessible here.
+                # It's defined globally in main.py, so it should be.
+                rate_string = get_dynamic_rate_limit(key)
+
+                # Parse the rate string to a Limit object (actually a list of them)
+                # We'll use the first one, assuming simple limits like "100/minute"
+                current_limit_obj_list = parse_many(rate_string)
+                if not current_limit_obj_list:
+                    logger.error(f"Could not parse rate string: {rate_string} for key {key}")
+                    return response
+
+                current_limit_obj: Limit = current_limit_obj_list[0]
+
+                # Get window stats
+                # get_window_stats expects a slowapi.models.Limit object, not just the string.
+                window_stats = limiter_instance.storage.get_window_stats(key, current_limit_obj)
+
+                reset_time = int(window_stats[0])
+                remaining_count = window_stats[1]
+                limit_amount = current_limit_obj.amount
+
+                response.headers["X-RateLimit-Limit"] = str(limit_amount)
+                response.headers["X-RateLimit-Remaining"] = str(remaining_count)
+                response.headers["X-RateLimit-Reset"] = str(reset_time)
+                logger.debug(f"Added rate limit headers for key {key}: Limit={limit_amount}, Remaining={remaining_count}, Reset={reset_time}")
+
+            except Exception as e:
+                logger.error(f"Error adding rate limit headers: {e}", exc_info=True)
+
+        return response
+
+# Custom RateLimitExceeded handler to add headers
+async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    """
+    Custom handler for RateLimitExceeded to add X-RateLimit headers.
+    """
+    response = JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": f"Rate limit exceeded: {exc.detail}"}
+    )
+
+    try:
+        key = exc.key if hasattr(exc, 'key') else getattr(request.state, 'rate_limit_key', None)
+        limit_obj = exc.limit if hasattr(exc, 'limit') else None
+
+        if key and limit_obj and hasattr(request.app.state, 'limiter'):
+            limiter_instance: Limiter = request.app.state.limiter
+            window_stats = limiter_instance.storage.get_window_stats(key, limit_obj) # exc.limit should be a Limit object
+
+            reset_time = int(window_stats[0])
+            # Remaining is 0 because the limit was exceeded
+
+            response.headers["X-RateLimit-Limit"] = str(limit_obj.amount)
+            response.headers["X-RateLimit-Remaining"] = "0"
+            response.headers["X-RateLimit-Reset"] = str(reset_time)
+            logger.debug(f"Added rate limit headers to 429 response for key {key}")
+        else:
+            logger.warning(f"Could not add rate limit headers to 429: key or limit_obj missing. Key from state: {key}, exc.limit: {limit_obj}")
+
+    except Exception as e:
+        logger.error(f"Error in custom_rate_limit_exceeded_handler adding headers: {e}", exc_info=True)
+
+    return response
+
 
 app = FastAPI()
 
-# Add Rate Limiter state and exception handler
+# Add Rate Limiter state and exception handler (custom one now)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
 
 
 # Add middlewares to the application
 # SecurityHeadersMiddleware should ideally be one of the first
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)
+# RateLimitHeaderMiddleware should be added after slowapi might have interacted (though it doesn't use middleware)
+# and after request.state.rate_limit_key is potentially set.
+# It should be one of the later middlewares so it can modify the final response.
+app.add_middleware(RateLimitHeaderMiddleware)
+
 
 # It's important that routers are included AFTER the limiter is set on app.state
-# and exception handlers are added, if the decorators need to access app.state.limiter via request.
-# However, for slowapi, the limiter instance is typically imported directly into the router files.
+# and exception handlers are added.
 app.include_router(auth_router.router) # Include the auth router
 app.include_router(users_router.router) # Include the users router
 
@@ -352,7 +493,8 @@ async def moderate_image_content(contents: bytes) -> ContentModerationResult:
 
 # Updated image upload endpoint
 @app.post("/api/images/upload", response_model=models.ImageSchema, status_code=status.HTTP_201_CREATED)
-async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_db)):
+@limiter.limit(get_dynamic_rate_limit)
+async def upload_image(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
     contents = await file.read()
     file_size = len(contents)
 
@@ -500,7 +642,8 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
 
 # Endpoint for Face Detection
 @app.get("/api/analysis/faces/{image_id}", response_model=FaceDetectionResponse)
-async def get_face_detections(image_id: uuid.UUID, db: Session = Depends(get_db)): # Changed image_id type to uuid.UUID
+@limiter.limit(get_dynamic_rate_limit)
+async def get_face_detections(request: Request, image_id: uuid.UUID, db: Session = Depends(get_db)): # Changed image_id type to uuid.UUID
     db_image = crud.get_image(db, image_id=image_id) # crud.get_image should handle UUID
     if not db_image:
         logger.warning(f"Face detection request for non-existent image_id: {image_id}")
@@ -540,7 +683,8 @@ async def get_face_detections(image_id: uuid.UUID, db: Session = Depends(get_db)
 
 
 @app.get("/api/analysis/quality/{image_id}", response_model=ImageQualityAnalysisResponse)
-async def get_image_quality_analysis(image_id: uuid.UUID, db: Session = Depends(get_db)):
+@limiter.limit(get_dynamic_rate_limit)
+async def get_image_quality_analysis(request: Request, image_id: uuid.UUID, db: Session = Depends(get_db)):
     db_image = crud.get_image(db, image_id=image_id)
     if not db_image:
         logger.warning(f"Image quality analysis request for non-existent image_id: {image_id}")
@@ -584,7 +728,9 @@ async def get_image_quality_analysis(image_id: uuid.UUID, db: Session = Depends(
 
 
 @app.get("/api/enhancement/auto/{image_id}", response_model=AutoEnhancementResponse)
+@limiter.limit(get_dynamic_rate_limit)
 async def get_auto_enhancement_parameters(
+    request: Request,
     image_id: uuid.UUID,
     mode: Optional[str] = None, # Allows for different enhancement modes e.g. "passport"
     db: Session = Depends(get_db)
@@ -666,8 +812,12 @@ async def get_auto_enhancement_parameters(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate auto enhancement parameters due to an internal error.")
 
 @app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
+@limiter.limit(get_dynamic_rate_limit)
 async def apply_image_enhancements_endpoint(
-    request: ImageEnhancementRequest,
+    # The 'request: Request' parameter for FastAPI/Starlette must come before `request: ImageEnhancementRequest` (Pydantic model)
+    # So, we rename one of them. Let's rename the FastAPI/Starlette request.
+    http_request: Request, # Renamed to avoid conflict with Pydantic model 'request'
+    request: ImageEnhancementRequest, # This is the Pydantic model for the request body
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user) # Added current_user
 ):
@@ -831,9 +981,11 @@ async def apply_image_enhancements_endpoint(
 
 
 @app.post("/api/enhancement/apply-preset/{preset_id}", response_model=ProcessedImageResponse)
+@limiter.limit(get_dynamic_rate_limit)
 async def apply_preset_to_image_endpoint(
+    http_request: Request, # Renamed to avoid conflict
     preset_id: uuid.UUID,
-    request_data: ApplyPresetRequest,
+    request_data: ApplyPresetRequest, # This is the Pydantic model for the request body
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):

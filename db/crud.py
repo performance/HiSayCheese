@@ -10,7 +10,12 @@ from models import models # Updated import to access Image model and Pydantic sc
 # or if .database still correctly provides it (which it does after previous subtask)
 
 # Let's adjust imports for clarity and correctness based on previous steps
-from models.models import Number, Image, ImageCreate, ImageSchema, User, UserCreate, EnhancementHistory, EnhancementHistoryBase
+from models.models import (
+    Number, Image, ImageCreate, ImageSchema,
+    User, UserCreate,
+    EnhancementHistory, EnhancementHistoryBase,
+    UserPreset, PresetCreate, PresetUpdate # Added UserPreset schemas
+)
 from typing import Optional, List # Added for Optional type hint
 from auth_utils import hash_password
 
@@ -97,3 +102,46 @@ def create_enhancement_history(db: Session, history_data: EnhancementHistoryBase
 
 def get_enhancement_history_by_user(db: Session, user_id: uuid.UUID, skip: int = 0, limit: int = 10) -> List[EnhancementHistory]:
     return db.query(EnhancementHistory).filter(EnhancementHistory.user_id == user_id).order_by(EnhancementHistory.created_at.desc()).offset(skip).limit(limit).all()
+
+
+# Functions for UserPreset model
+
+def create_user_preset(db: Session, preset_data: PresetCreate, user_id: uuid.UUID) -> UserPreset:
+    db_preset = UserPreset(
+        user_id=user_id,
+        preset_name=preset_data.preset_name,
+        parameters_json=preset_data.parameters_json
+    )
+    db.add(db_preset)
+    db.commit()
+    db.refresh(db_preset)
+    return db_preset
+
+def get_user_presets_by_user(db: Session, user_id: uuid.UUID) -> List[UserPreset]:
+    return db.query(UserPreset).filter(UserPreset.user_id == user_id).order_by(UserPreset.created_at.desc()).all()
+
+def get_user_preset(db: Session, preset_id: uuid.UUID, user_id: uuid.UUID) -> Optional[UserPreset]:
+    return db.query(UserPreset).filter(UserPreset.id == preset_id, UserPreset.user_id == user_id).first()
+
+def update_user_preset(db: Session, preset_id: uuid.UUID, preset_data: PresetUpdate, user_id: uuid.UUID) -> Optional[UserPreset]:
+    db_preset = get_user_preset(db, preset_id=preset_id, user_id=user_id)
+    if db_preset:
+        update_data = preset_data.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(db_preset, key, value)
+        db.commit()
+        db.refresh(db_preset)
+    return db_preset
+
+def delete_user_preset(db: Session, preset_id: uuid.UUID, user_id: uuid.UUID) -> Optional[UserPreset]:
+    db_preset = get_user_preset(db, preset_id=preset_id, user_id=user_id)
+    if db_preset:
+        db.delete(db_preset)
+        db.commit()
+        # After deletion, the object db_preset becomes detached.
+        # Some ORMs/setups might expire attributes on it.
+        # It's common to return the object as it was before deletion, or a boolean status.
+        # For consistency with update returning the object, we can return it here too.
+        # Or, if the object's state is unreliable post-delete, return True.
+        # Let's return the object as it provides info about what was deleted.
+    return db_preset

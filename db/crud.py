@@ -11,6 +11,7 @@ from models import models # Updated import to access Image model and Pydantic sc
 
 # Let's adjust imports for clarity and correctness based on previous steps
 from models.models import Number, Image, ImageCreate, ImageSchema
+from typing import Optional # Added for Optional type hint
 
 def get_number(db: Session):
     return db.query(models.Number).first() # Adjusted to use models.Number
@@ -36,12 +37,25 @@ def increment_number(db: Session):
     return None
 
 # Functions for Image model
-def create_image(db: Session, image: ImageCreate) -> models.Image:
+def create_image(
+    db: Session,
+    image: ImageCreate,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    format: Optional[str] = None,
+    exif_orientation: Optional[int] = None,
+    color_profile: Optional[str] = None
+) -> models.Image:
     db_image = models.Image(
         filename=image.filename,
         filepath=image.filepath,
         filesize=image.filesize,
-        mimetype=image.mimetype
+        mimetype=image.mimetype,
+        width=width,
+        height=height,
+        format=format,
+        exif_orientation=exif_orientation,
+        color_profile=color_profile
     )
     db.add(db_image)
     db.commit()

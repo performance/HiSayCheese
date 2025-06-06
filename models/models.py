@@ -23,6 +23,11 @@ class Image(Base):
     filepath = Column(String)
     filesize = Column(Integer)
     mimetype = Column(String)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    format = Column(String, nullable=True)
+    exif_orientation = Column(Integer, nullable=True)
+    color_profile = Column(String, nullable=True)
     rejection_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -41,15 +46,25 @@ class NumberSchema(NumberBase):
 # Pydantic schema for creating an Image
 class ImageCreate(BaseModel):
     filename: str
-    filepath: str
+    filepath: Optional[str] = None
     filesize: int
     mimetype: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    format: Optional[str] = None
+    exif_orientation: Optional[int] = None
+    color_profile: Optional[str] = None
     rejection_reason: Optional[str] = None
 
 # Pydantic schema for reading/returning an Image
 class ImageSchema(ImageCreate): # Inherits fields from ImageCreate
     id: uuid.UUID
     created_at: datetime
+    width: Optional[int] = None
+    height: Optional[int] = None
+    format: Optional[str] = None
+    exif_orientation: Optional[int] = None
+    color_profile: Optional[str] = None
     rejection_reason: Optional[str] = None
 
     class Config:

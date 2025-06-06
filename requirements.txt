@@ -13,3 +13,4 @@ email-validator
 python-jose[cryptography]
 Werkzeug
 slowapi
+boto3

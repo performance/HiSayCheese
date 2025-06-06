@@ -12,12 +12,14 @@ from models import models # Updated import to access Image model and Pydantic sc
 # Let's adjust imports for clarity and correctness based on previous steps
 from models.models import (
     Number, Image, ImageCreate, ImageSchema,
-    User, UserCreate,
+    User, UserCreate, # User model and UserCreate Pydantic schema
     EnhancementHistory, EnhancementHistoryBase,
     UserPreset, PresetCreate, PresetUpdate # Added UserPreset schemas
 )
 from typing import Optional, List # Added for Optional type hint
 from auth_utils import hash_password
+from datetime import datetime, timedelta # Added for token expiry
+import secrets # Added for secure token generation
 
 def get_number(db: Session):
     return db.query(models.Number).first() # Adjusted to use models.Number
@@ -77,7 +79,16 @@ def get_user_by_email(db: Session, email: str) -> Optional[User]:
 
 def create_user(db: Session, user: UserCreate) -> User:
     hashed_pass = hash_password(user.password)
-    db_user = User(email=user.email, hashed_password=hashed_pass)
+    verification_token = secrets.token_urlsafe(32)
+    token_expiry_time = datetime.utcnow() + timedelta(hours=24) # Token valid for 24 hours
+
+    db_user = User(
+        email=user.email,
+        hashed_password=hashed_pass,
+        is_verified=False,
+        verification_token=verification_token,
+        verification_token_expires_at=token_expiry_time
+    )
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
@@ -86,6 +97,22 @@ def create_user(db: Session, user: UserCreate) -> User:
 def get_user_by_id(db: Session, user_id: uuid.UUID) -> Optional[User]:
     return db.query(User).filter(User.id == user_id).first()
 
+def get_user_by_verification_token(db: Session, token: str) -> Optional[User]:
+    """
+    Retrieves a user by their verification token.
+    """
+    return db.query(User).filter(User.verification_token == token).first()
+
+def mark_user_as_verified(db: Session, user: User) -> User:
+    """
+    Marks a user as verified and clears the verification token.
+    """
+    user.is_verified = True
+    user.verification_token = None
+    user.verification_token_expires_at = None
+    db.commit()
+    db.refresh(user)
+    return user
 
 # Functions for EnhancementHistory model
 def create_enhancement_history(db: Session, history_data: EnhancementHistoryBase, user_id: uuid.UUID) -> EnhancementHistory:

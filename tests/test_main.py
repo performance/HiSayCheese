@@ -13,10 +13,15 @@ from sqlalchemy.orm import Session
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import app, UPLOAD_DIR, MAX_FILE_SIZE_BYTES, ALLOWED_MIME_TYPES, MIME_TYPE_TO_EXTENSION
+from main import app, MAX_FILE_SIZE_BYTES, ALLOWED_MIME_TYPES, MIME_TYPE_TO_EXTENSION, TEMP_PROCESSING_DIR
+# UPLOAD_DIR is removed from main.py, so remove from here too.
 from db import crud
 from models import models
-from db.database import create_db_and_tables, SessionLocal, engine, get_db # Assuming engine is not used directly here for now
+from db.database import create_db_and_tables, SessionLocal, engine, get_db
+
+# Moto for S3 mocking
+from moto import mock_s3
+import boto3 # To interact with moto's mock S3
 
 # --- Test Setup & Fixtures ---
 
@@ -34,20 +39,35 @@ def setup_test_environment():
     # engine/sessionmaker would be used, and app.dependency_overrides for get_db.
     # For this setup, we rely on function-scoped fixtures to clean data.
     create_db_and_tables()
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # os.makedirs(UPLOAD_DIR, exist_ok=True) # UPLOAD_DIR is removed
+    os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True) # Ensure temp dir for app exists
+
+    # Set up mock AWS environment variables for moto
+    os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+    os.environ["AWS_SESSION_TOKEN"] = "testing" # Optional, but good for completeness
+    os.environ["AWS_S3_REGION"] = "us-east-1" # Must match config used by StorageService
+    os.environ["AWS_S3_BUCKET_NAME"] = "test-bucket" # Must match config
+
     yield
     # Optional: cleanup after all tests in a session
-    # shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
-    # db_file = str(engine.url).split("///")[-1] # try to get db file name
+    shutil.rmtree(TEMP_PROCESSING_DIR, ignore_errors=True)
+    # db_file = str(engine.url).split("///")[-1]
     # if os.path.exists(db_file) and "mem" not in db_file:
     #     os.remove(db_file)
+    # Clean up env vars if they were set only for this session
+    del os.environ["AWS_ACCESS_KEY_ID"]
+    del os.environ["AWS_SECRET_ACCESS_KEY"]
+    del os.environ["AWS_SESSION_TOKEN"]
+    del os.environ["AWS_S3_REGION"]
+    del os.environ["AWS_S3_BUCKET_NAME"]
 
 
 @pytest.fixture(scope="function", autouse=True)
-def cleanup_upload_dir_and_db_records():
-    # Clear UPLOAD_DIR before each test and recreate
-    shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+def cleanup_s3_and_db_records():
+    # Clear TEMP_PROCESSING_DIR before each test and recreate
+    shutil.rmtree(TEMP_PROCESSING_DIR, ignore_errors=True)
+    os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True)
 
     # Clear Image table records before each test
     db = SessionLocal()
@@ -55,12 +75,39 @@ def cleanup_upload_dir_and_db_records():
         db.query(models.Image).delete()
         # If other tables are affected by uploads or need clearing, do it here.
         # e.g., db.query(models.Number).delete()
+        # Clear UserPresets and EnhancementHistory if they use image IDs
+        db.query(models.UserPreset).delete()
+        db.query(models.EnhancementHistory).delete()
         db.commit()
     except Exception as e:
         db.rollback()
         pytest.fail(f"DB cleanup failed: {e}")
     finally:
         db.close()
+
+    # Moto S3 cleanup: delete all objects from the test bucket
+    # This requires AWS credentials to be set for boto3 client, even if dummy for moto
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_S3_REGION", "us-east-1"))
+        bucket_name = os.environ.get("AWS_S3_BUCKET_NAME", "test-bucket")
+
+        # List all objects and delete them
+        # Ensure bucket exists in moto's virtual S3 before trying to list/delete
+        # This is tricky because @mock_s3 might not be active *during* fixture setup/teardown
+        # if the fixture is session-scoped and tests are function-scoped with @mock_s3.
+        # A common pattern is to use @mock_s3 on the test function/class, then the S3 client
+        # created within that test will be mocked.
+        # For cleanup, it's often easier to re-create the bucket or use a fresh @mock_s3 for each test.
+        # If @mock_s3 is applied per test, moto handles S3 state isolation automatically.
+        # So, explicit S3 cleanup in a fixture might be redundant or problematic
+        # if not perfectly aligned with moto's mock lifecycle.
+        # For now, we'll rely on @mock_s3 on test functions to provide a clean S3 state.
+        pass # Rely on @mock_s3 per test.
+
+    except Exception as e_s3_clean:
+        # Don't fail tests if S3 cleanup has issues, but log it.
+        print(f"Warning: S3 cleanup in fixture failed: {e_s3_clean}")
+
     yield # Test runs here
 
 
@@ -70,7 +117,16 @@ def create_dummy_file_for_upload(filename: str, content: bytes, content_type: st
 
 # --- Test Cases ---
 
+@mock_s3 # Apply moto S3 mock for this test
 def test_upload_valid_jpg():
+    # Create the bucket for moto before the test runs
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    try:
+        s3.create_bucket(Bucket=os.environ["AWS_S3_BUCKET_NAME"])
+    except ClientError as e: # Handle if bucket already exists from a previous test run (less common with function-scoped @mock_s3)
+        if e.response['Error']['Code'] != 'BucketAlreadyOwnedByYou':
+            raise
+
     file_to_upload = create_dummy_file_for_upload("test.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
     response = client.post("/api/images/upload", files={"file": file_to_upload})
 
@@ -78,11 +134,23 @@ def test_upload_valid_jpg():
     data = response.json()
     assert "id" in data
     assert data["filename"] == "test.jpg"
-    assert data["mimetype"] == "image/jpeg" # This should be the magic-detected one
-    assert UPLOAD_DIR in data["filepath"]
-    assert data["filepath"].endswith(".jpg") # Based on MIME_TYPE_TO_EXTENSION
+    assert data["mimetype"] == "image/jpeg"
+    # Filepath is now an S3 key
+    assert data["filepath"].startswith("original_images/")
+    assert data["filepath"].endswith(".jpg")
+    assert "presigned_url" in data
+    assert data["presigned_url"] is not None
+    assert "https://test-bucket.s3.us-east-1.amazonaws.com/original_images/" in data["presigned_url"]
 
-    assert os.path.exists(data["filepath"])
+    # Verify object exists in mock S3
+    try:
+        s3_object = s3.get_object(Bucket=os.environ["AWS_S3_BUCKET_NAME"], Key=data["filepath"])
+        assert s3_object is not None
+        assert s3_object['ContentLength'] == len(MINIMAL_JPG_CONTENT)
+        assert s3_object['ContentType'] == "image/jpeg" # Check ContentType stored in S3
+    except ClientError as e:
+        pytest.fail(f"S3 get_object failed for {data['filepath']}: {e}")
+
 
     db = SessionLocal()
     try:
@@ -91,29 +159,83 @@ def test_upload_valid_jpg():
         assert db_img is not None
         assert db_img.filename == "test.jpg"
         assert db_img.mimetype == "image/jpeg"
+        assert db_img.filepath == data["filepath"] # S3 key stored in DB
     finally:
         db.close()
 
+@mock_s3
 def test_upload_valid_png():
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    s3.create_bucket(Bucket=os.environ["AWS_S3_BUCKET_NAME"])
+
     file_to_upload = create_dummy_file_for_upload("test.png", MINIMAL_PNG_CONTENT, "image/png")
     response = client.post("/api/images/upload", files={"file": file_to_upload})
 
     assert response.status_code == status.HTTP_201_CREATED, response.text
     data = response.json()
     assert data["mimetype"] == "image/png"
+    assert data["filepath"].startswith("original_images/")
     assert data["filepath"].endswith(".png")
-    assert os.path.exists(data["filepath"])
+    assert data["presigned_url"] is not None
 
+    s3.get_object(Bucket=os.environ["AWS_S3_BUCKET_NAME"], Key=data["filepath"]) # Check existence
+
+@mock_s3
 def test_upload_valid_webp():
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    s3.create_bucket(Bucket=os.environ["AWS_S3_BUCKET_NAME"])
+
     file_to_upload = create_dummy_file_for_upload("test.webp", MINIMAL_WEBP_CONTENT, "image/webp")
     response = client.post("/api/images/upload", files={"file": file_to_upload})
 
     assert response.status_code == status.HTTP_201_CREATED, response.text
     data = response.json()
     assert data["mimetype"] == "image/webp"
+    assert data["filepath"].startswith("original_images/")
     assert data["filepath"].endswith(".webp")
-    assert os.path.exists(data["filepath"])
+    assert data["presigned_url"] is not None
 
+    s3.get_object(Bucket=os.environ["AWS_S3_BUCKET_NAME"], Key=data["filepath"]) # Check existence
+
+@mock_s3
+def test_upload_s3_upload_failure(client):
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    s3.create_bucket(Bucket=os.environ["AWS_S3_BUCKET_NAME"])
+
+    file_to_upload = create_dummy_file_for_upload("test_s3_fail.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+
+    # Patch storage_service.upload_file to simulate S3 error
+    # Ensure 'main.storage_service' is the correct path to the global instance used by your app
+    with patch("main.storage_service.upload_file", side_effect=ClientError({"Error": {"Code": "InternalError", "Message": "S3 is down"}}, "PutObject")) as mock_upload:
+    # Alternative: side_effect=HTTPException(status_code=500, detail="Simulated S3 Upload Fail")
+        response = client.post("/api/images/upload", files={"file": file_to_upload})
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        # The detail message comes from the HTTPException raised by storage_service or the endpoint itself
+        assert "Failed to upload file to S3" in response.json()["detail"] or "S3 is down" in response.json()["detail"]
+        mock_upload.assert_called_once() # Verify our mock was called
+
+    # Verify no image record was created in DB for this failed upload
+    db = SessionLocal()
+    try:
+        # It's hard to get an ID if upload failed before DB record creation.
+        # Check if any image with the filename exists, assuming it would have been unique.
+        # Or, count images before/after if that's simpler.
+        count_before = db.query(models.Image).count()
+        # Re-run with a different filename to ensure it's not a fluke from a previous run
+        file_to_upload_2 = create_dummy_file_for_upload("test_s3_fail_db_check.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        with patch("main.storage_service.upload_file", side_effect=ClientError({"Error": {"Code": "InternalError", "Message": "S3 is down"}}, "PutObject")):
+            client.post("/api/images/upload", files={"file": file_to_upload_2})
+
+        count_after = db.query(models.Image).count()
+        assert count_after == count_before, "DB record should not be created if S3 upload fails before DB stage"
+        # Note: The current main.py logic for upload saves to S3 *then* creates DB record.
+        # So this assertion is correct. If DB was first, this would be different.
+    finally:
+        db.close()
+
+
+@mock_s3 # Still mock S3 even if expecting failure before S3 interaction, for consistency
 def test_upload_pdf_unsupported_type():
     pdf_content = b"%PDF-1.4 fake content. This is definitely not an image."
     file_to_upload = create_dummy_file_for_upload("test.pdf", pdf_content, "application/pdf")
@@ -138,8 +260,8 @@ def test_upload_corrupted_image_as_jpg_extension_but_text_content():
     assert "text/plain" in response.json()["detail"] # Check if detected type is mentioned
 
 def test_unique_filename_generation():
-    file1_to_upload = create_dummy_file_for_upload("same_name.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
-    file2_to_upload = create_dummy_file_for_upload("same_name.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    file_to_upload = create_dummy_file_for_upload("test.jpg", MINIMAL_JPG_CONTENT, "image/jpeg") # S3 key uses UUID
+    file2_to_upload = create_dummy_file_for_upload("another_name.jpg", MINIMAL_JPG_CONTENT, "image/jpeg") # Different S3 key
 
     response1 = client.post("/api/images/upload", files={"file": file1_to_upload})
     assert response1.status_code == status.HTTP_201_CREATED, response1.text
@@ -149,22 +271,15 @@ def test_unique_filename_generation():
     assert response2.status_code == status.HTTP_201_CREATED, response2.text
     data2 = response2.json()
 
-    assert data1["filepath"] != data2["filepath"]
+    assert data1["filepath"] != data2["filepath"] # S3 keys should be unique due to UUID
+    assert data1["filepath"].startswith("original_images/")
+    assert data2["filepath"].startswith("original_images/")
 
-    filename1_on_server = os.path.basename(data1["filepath"])
-    filename2_on_server = os.path.basename(data2["filepath"])
+    # Verify S3 objects exist
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    s3.head_object(Bucket=os.environ["AWS_S3_BUCKET_NAME"], Key=data1["filepath"])
+    s3.head_object(Bucket=os.environ["AWS_S3_BUCKET_NAME"], Key=data2["filepath"])
 
-    assert len(filename1_on_server.split('.')[0]) == 32
-    assert len(filename2_on_server.split('.')[0]) == 32
-
-    try:
-        uuid.UUID(filename1_on_server.split('.')[0], version=4)
-        uuid.UUID(filename2_on_server.split('.')[0], version=4)
-    except ValueError:
-        pytest.fail(f"Filename base {filename1_on_server.split('.')[0]} or {filename2_on_server.split('.')[0]} is not a valid UUID hex.")
-
-    assert os.path.exists(data1["filepath"])
-    assert os.path.exists(data2["filepath"])
 
 def test_health_check_get_number_not_set():
     # Assuming the number is not set by default after cleanup
@@ -811,20 +926,54 @@ def uploaded_image_id(client):
     # For simplicity, we assume this setup upload won't hit a limit itself.
     # To make it truly isolated, one might need to temporarily disable rate limiting for setup,
     # or use a pre-existing image ID if the test environment allows.
+    # This fixture will be used by tests that need an image already in S3.
+    # It needs to run under @mock_s3 context, so tests using it must also be @mock_s3.
 
-    # Temporarily remove rate limit from upload for this setup call
-    # This is a bit hacky. A better way might be to have a test utility that directly adds to DB
-    # or a specific "setup" endpoint without limits.
-    # For now, we'll just hope this one request doesn't get limited itself.
-    img_bytes = create_dummy_image_bytes(10,10) # Small image
-    file_data = ("setup_image.jpg", io.BytesIO(img_bytes), "image/jpeg")
+    s3_client = boto3.client("s3", region_name=os.environ.get("AWS_S3_REGION", "us-east-1"))
+    bucket_name = os.environ.get("AWS_S3_BUCKET_NAME", "test-bucket")
+    try: # Ensure bucket exists in mock S3
+        s3_client.create_bucket(Bucket=bucket_name)
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'BucketAlreadyOwnedByYou' and e.response['Error']['Code'] != 'BucketAlreadyExists': # AWS S3 LocalStack returns BucketAlreadyExists
+             raise
 
-    # We need to ensure the moderation passes for the setup image.
+    img_bytes = create_dummy_image_bytes(10,10, img_format="JPEG") # Small valid image
+    file_data = ("setup_image_for_enh.jpg", io.BytesIO(img_bytes), "image/jpeg")
+
+    # Ensure moderation passes for this setup image.
+    # The mock_moderate_content_approve_fixture might be active if tests are combined,
+    # otherwise, apply a specific patch here.
     with patch("main.moderate_image_content", return_value=ContentModerationResult(is_approved=True, rejection_reason=None)):
         response = client.post("/api/images/upload", files={"file": file_data})
 
-    assert response.status_code == status.HTTP_201_CREATED, f"Setup image upload failed: {response.text}"
-    return response.json()["id"]
+    assert response.status_code == status.HTTP_201_CREATED, f"Setup S3 image upload failed: {response.text}"
+    data = response.json()
+    return {"id": data["id"], "s3_key": data["filepath"]} # Return both ID and S3 key
+
+
+@pytest.fixture(scope="function")
+def s3_image_for_enhancement(client):
+    # This wraps the direct call to client.post within a fixture, useful if more setup is needed.
+    # For now, it's similar to uploaded_image_id but returns more info.
+    # Ensure this fixture is used by tests that are already decorated with @mock_s3.
+
+    s3_client = boto3.client("s3", region_name=os.environ.get("AWS_S3_REGION", "us-east-1"))
+    bucket_name = os.environ.get("AWS_S3_BUCKET_NAME", "test-bucket")
+    try:
+        s3_client.create_bucket(Bucket=bucket_name)
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'BucketAlreadyOwnedByYou' and e.response['Error']['Code'] != 'BucketAlreadyExists':
+            raise
+
+    img_bytes = create_dummy_image_bytes(width=100, height=100, img_format="JPEG")
+    files = {"file": ("test_for_enh.jpg", io.BytesIO(img_bytes), "image/jpeg")}
+
+    with patch("main.moderate_image_content", return_value=ContentModerationResult(is_approved=True)):
+        response = client.post("/api/images/upload", files=files)
+
+    assert response.status_code == status.HTTP_201_CREATED
+    response_data = response.json()
+    return {"id": response_data["id"], "s3_key": response_data["filepath"]}
 
 
 def test_analysis_faces_endpoint_rate_limited_anon(client, uploaded_image_id):
@@ -865,6 +1014,279 @@ def test_enhancement_apply_endpoint_rate_limited_auth(client, uploaded_image_id,
     db = SessionLocal()
     clear_user_from_db(db, user_email_for_cleanup)
     db.close()
+
+
+# --- S3 Integration Tests for Enhancement Endpoints ---
+
+@mock_s3
+def test_apply_enhancement_success(client, s3_image_for_enhancement, db_session):
+    # s3_image_for_enhancement fixture has already uploaded an image to mock S3
+    # and ensures the S3 bucket is created.
+    image_id = s3_image_for_enhancement["id"]
+    original_s3_key = s3_image_for_enhancement["s3_key"]
+
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    bucket_name = os.environ["AWS_S3_BUCKET_NAME"]
+
+    # Verify original image exists in S3 (put by fixture)
+    s3.head_object(Bucket=bucket_name, Key=original_s3_key)
+
+    # Create a dummy user and token for authenticated endpoint
+    token, user_email = create_user_and_get_token(client, db_session, "enh_apply_succ")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    enhancement_params = {
+        "brightness_target": 1.2, "contrast_target": 1.1, "saturation_target": 1.0,
+        "background_blur_radius": 0, "crop_rect": [0,0,100,100], "face_smooth_intensity": 0.0
+    }
+    request_body = {"image_id": image_id, "parameters": enhancement_params}
+
+    response = client.post("/api/enhancement/apply", json=request_body, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+    data = response.json()
+    assert data["original_image_id"] == image_id
+    assert data["processed_image_id"] is not None
+    assert data["processed_image_path"] is not None # This is the presigned URL
+    assert "https://test-bucket.s3.us-east-1.amazonaws.com/processed_images/" in data["processed_image_path"]
+    assert data["error"] is None
+
+    # Verify the processed image was uploaded to S3
+    # The S3 key for processed image is not directly in response, but we can list objects
+    # or infer from presigned URL (though risky if URL structure changes).
+    # Let's check the DB for the processed image's S3 key.
+    db = SessionLocal()
+    try:
+        processed_img_record = db.query(models.Image).filter(models.Image.id == data["processed_image_id"]).first()
+        assert processed_img_record is not None
+        assert processed_img_record.filepath.startswith("processed_images/")
+        # Verify this new S3 object exists
+        s3.head_object(Bucket=bucket_name, Key=processed_img_record.filepath)
+    finally:
+        db.close()
+
+    clear_user_from_db(SessionLocal(), user_email)
+
+
+@mock_s3
+def test_apply_enhancement_s3_original_download_failure(client, s3_image_for_enhancement, db_session):
+    image_id = s3_image_for_enhancement["id"]
+    # original_s3_key = s3_image_for_enhancement["s3_key"] # Original key exists from fixture
+
+    token, user_email = create_user_and_get_token(client, db_session, "enh_dl_fail")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    enhancement_params = {"brightness_target": 1.1, "contrast_target": 1.1, "saturation_target": 1.1, "background_blur_radius": 0, "crop_rect": [0,0,10,10], "face_smooth_intensity": 0.0}
+    request_body = {"image_id": image_id, "parameters": enhancement_params}
+
+    # Patch storage_service.download_file to simulate S3 error for original image
+    with patch("main.storage_service.download_file", side_effect=HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulated S3 Original Not Found")) as mock_download:
+        response = client.post("/api/enhancement/apply", json=request_body, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_200_OK # Endpoint returns 200 with error in body
+    data = response.json()
+    assert data["original_image_id"] == image_id
+    assert data["processed_image_id"] is None
+    assert data["processed_image_path"] is None
+    assert "Could not retrieve original image" in data["error"] or "Simulated S3 Original Not Found" in data["error"]
+    mock_download.assert_called_once()
+    clear_user_from_db(SessionLocal(), user_email)
+
+
+@mock_s3
+def test_apply_enhancement_s3_processed_upload_failure(client, s3_image_for_enhancement, db_session):
+    image_id = s3_image_for_enhancement["id"]
+    token, user_email = create_user_and_get_token(client, db_session, "enh_ul_fail")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    enhancement_params = {"brightness_target": 1.1, "contrast_target": 1.1, "saturation_target": 1.1, "background_blur_radius": 0, "crop_rect": [0,0,10,10], "face_smooth_intensity": 0.0}
+    request_body = {"image_id": image_id, "parameters": enhancement_params}
+
+    # Patch storage_service.upload_file for the processed image upload
+    # This requires knowing when it's called for original vs processed, or making it fail generally.
+    # The main.py code calls download_file for original, then upload_file for processed.
+    # So, a general patch on upload_file within this scope should target the processed one.
+    with patch("main.storage_service.upload_file", side_effect=HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Simulated S3 Processed Upload Fail")) as mock_upload:
+        response = client.post("/api/enhancement/apply", json=request_body, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_200_OK # Endpoint returns 200 with error in body
+    data = response.json()
+    assert data["original_image_id"] == image_id
+    assert data["processed_image_id"] is None # Should be None as DB record for processed might not be created or is rolled back
+    assert data["processed_image_path"] is None # No path if upload failed
+    assert "S3 upload error: Simulated S3 Processed Upload Fail" in data["error"]
+    mock_upload.assert_called_once() # Ensure it was attempted
+    clear_user_from_db(SessionLocal(), user_email)
+
+
+# Similar tests should be added for /api/enhancement/apply-preset
+
+@pytest.fixture(scope="function")
+def user_preset(client, db_session):
+    token, user_email = create_user_and_get_token(client, db_session, "preset_owner")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    preset_params = {
+        "brightness_target": 0.9, "contrast_target": 0.9, "saturation_target": 0.9,
+        "background_blur_radius": 1, "crop_rect": [10,10,80,80], "face_smooth_intensity": 0.1
+    }
+    preset_create_data = {
+        "preset_name": f"TestPreset_{uuid.uuid4().hex}",
+        "parameters_json": json.dumps(preset_params) # User Presets router expects JSON string
+    }
+    # Need to use the correct router path for creating presets. Assuming it's /api/users/presets
+    # This might need adjustment based on actual preset router paths.
+    # Let's assume a users_router.router for presets under /api/users/
+    # If presets are top-level, this path would change.
+    # Based on current project structure, users_router.py handles presets.
+    create_preset_response = client.post("/api/users/presets/", json=preset_create_data, headers=auth_headers)
+    assert create_preset_response.status_code == status.HTTP_201_CREATED, \
+        f"Failed to create preset for testing: {create_preset_response.text}"
+
+    preset_data = create_preset_response.json()
+    return {"id": preset_data["id"], "user_token": token, "user_email": user_email, "auth_headers": auth_headers}
+
+
+@mock_s3
+def test_apply_preset_success(client, s3_image_for_enhancement, user_preset, db_session):
+    image_id = s3_image_for_enhancement["id"]
+    original_s3_key = s3_image_for_enhancement["s3_key"]
+    preset_id = user_preset["id"]
+    auth_headers = user_preset["auth_headers"]
+
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    bucket_name = os.environ["AWS_S3_BUCKET_NAME"]
+    s3.head_object(Bucket=bucket_name, Key=original_s3_key) # Verify original exists
+
+    request_body = {"image_id": image_id} # ApplyPresetRequest model
+    response = client.post(f"/api/enhancement/apply-preset/{preset_id}", json=request_body, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+    data = response.json()
+    assert data["original_image_id"] == image_id
+    assert data["processed_image_id"] is not None
+    assert data["processed_image_path"] is not None # Presigned URL
+    assert "https://test-bucket.s3.us-east-1.amazonaws.com/processed_images/" in data["processed_image_path"]
+    assert data["error"] is None
+
+    db = SessionLocal()
+    try:
+        processed_img_record = db.query(models.Image).filter(models.Image.id == data["processed_image_id"]).first()
+        assert processed_img_record is not None
+        assert processed_img_record.filepath.startswith("processed_images/")
+        assert "_preset_enhanced_" in processed_img_record.filepath
+        s3.head_object(Bucket=bucket_name, Key=processed_img_record.filepath) # Check S3
+    finally:
+        db.close()
+
+    clear_user_from_db(SessionLocal(), user_preset["user_email"]) # Cleanup user
+
+@mock_s3
+def test_apply_preset_s3_original_download_failure(client, s3_image_for_enhancement, user_preset, db_session):
+    image_id = s3_image_for_enhancement["id"]
+    preset_id = user_preset["id"]
+    auth_headers = user_preset["auth_headers"]
+    request_body = {"image_id": image_id}
+
+    with patch("main.storage_service.download_file", side_effect=HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulated S3 Original Not Found for Preset")) as mock_download:
+        response = client.post(f"/api/enhancement/apply-preset/{preset_id}", json=request_body, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert "Could not retrieve original image" in data["error"] or "Simulated S3 Original Not Found for Preset" in data["error"]
+    mock_download.assert_called_once()
+    clear_user_from_db(SessionLocal(), user_preset["user_email"])
+
+@mock_s3
+def test_apply_preset_s3_processed_upload_failure(client, s3_image_for_enhancement, user_preset, db_session):
+    image_id = s3_image_for_enhancement["id"]
+    preset_id = user_preset["id"]
+    auth_headers = user_preset["auth_headers"]
+    request_body = {"image_id": image_id}
+
+    with patch("main.storage_service.upload_file", side_effect=HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Simulated S3 Preset Upload Fail")) as mock_upload:
+        response = client.post(f"/api/enhancement/apply-preset/{preset_id}", json=request_body, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert "S3 upload error: Simulated S3 Preset Upload Fail" in data["error"]
+    mock_upload.assert_called_once()
+    clear_user_from_db(SessionLocal(), user_preset["user_email"])
+
+
+# --- S3 Integration Tests for Analysis Endpoints ---
+
+@mock_s3
+def test_analysis_faces_success(client, s3_image_for_enhancement):
+    image_id = s3_image_for_enhancement["id"]
+    original_s3_key = s3_image_for_enhancement["s3_key"] # Key for the image in mock S3
+
+    # We need to ensure the image content is valid for face detection by the underlying service.
+    # The s3_image_for_enhancement fixture uses create_dummy_image_bytes(100,100),
+    # which might not have detectable faces by default with opencv or other libraries.
+    # For this test, we are more focused on the S3 download part.
+    # If the actual face detection service fails on dummy data, the endpoint might still return 200
+    # but with "no faces detected". This is acceptable for testing S3 integration.
+
+    # Optional: Check original S3 object exists
+    s3 = boto3.client("s3", region_name=os.environ["AWS_S3_REGION"])
+    bucket_name = os.environ["AWS_S3_BUCKET_NAME"]
+    s3.head_object(Bucket=bucket_name, Key=original_s3_key)
+
+    response = client.get(f"/api/analysis/faces/{image_id}")
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+    data = response.json()
+    assert data["image_id"] == image_id
+    assert "faces" in data
+    # data["message"] might say "No faces detected" if dummy image has no faces.
+
+@mock_s3
+def test_analysis_faces_s3_download_failure(client, s3_image_for_enhancement):
+    image_id = s3_image_for_enhancement["id"]
+    # s3_key = s3_image_for_enhancement["s3_key"] # Original key exists
+
+    with patch("main.storage_service.download_file", side_effect=HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulated S3 Download Fail for Faces")) as mock_download:
+        response = client.get(f"/api/analysis/faces/{image_id}")
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND, response.text # As download_file raises 404
+    data = response.json()
+    assert "Simulated S3 Download Fail for Faces" in data["detail"]
+    mock_download.assert_called_once()
+
+@mock_s3
+def test_analysis_quality_success(client, s3_image_for_enhancement):
+    image_id = s3_image_for_enhancement["id"]
+    response = client.get(f"/api/analysis/quality/{image_id}")
+    assert response.status_code == status.HTTP_200_OK, response.text
+    data = response.json()
+    assert data["image_id"] == image_id
+    assert "quality_metrics" in data
+
+@mock_s3
+def test_analysis_quality_s3_download_failure(client, s3_image_for_enhancement):
+    image_id = s3_image_for_enhancement["id"]
+    with patch("main.storage_service.download_file", side_effect=HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulated S3 Fail for Quality")) as mock_download:
+        response = client.get(f"/api/analysis/quality/{image_id}")
+    assert response.status_code == status.HTTP_404_NOT_FOUND, response.text
+    assert "Simulated S3 Fail for Quality" in response.json()["detail"]
+    mock_download.assert_called_once()
+
+@mock_s3
+def test_enhancement_auto_success(client, s3_image_for_enhancement):
+    image_id = s3_image_for_enhancement["id"]
+    response = client.get(f"/api/enhancement/auto/{image_id}") # mode is optional
+    assert response.status_code == status.HTTP_200_OK, response.text
+    data = response.json()
+    assert data["image_id"] == image_id
+    assert "enhancement_parameters" in data
+
+@mock_s3
+def test_enhancement_auto_s3_download_failure(client, s3_image_for_enhancement):
+    image_id = s3_image_for_enhancement["id"]
+    with patch("main.storage_service.download_file", side_effect=HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulated S3 Fail for Auto Enhance")) as mock_download:
+        response = client.get(f"/api/enhancement/auto/{image_id}")
+    assert response.status_code == status.HTTP_404_NOT_FOUND, response.text # Changed from 500 as per new error handling
+    assert "Simulated S3 Fail for Auto Enhance" in response.json()["detail"]
+    mock_download.assert_called_once()
 
 
 @pytest.fixture

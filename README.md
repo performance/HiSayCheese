@@ -94,7 +94,13 @@ HiSayCheese offers an innovative solution: users can simply upload a selfie, and
     *   OpenCV (for image manipulation, transformations).
     *   Deepface, facenet (for face analysis, potentially quality assessment).
     *   TensorFlow.js / face-api.js (for client-side AI tasks if feasible and performant).
-*   **Backend:** Firebase (as considered in the original project setup, for auth, database, storage), Node.js (for server-side logic and AI model interaction).
+*   **Backend:**
+    *   FastAPI (Python) for the main API.
+    *   SQLAlchemy with PostgreSQL or SQLite for database.
+    *   Firebase (for auth, potentially user metadata/preferences).
+    *   Node.js (potentially for specific microservices or AI model interaction if not directly in Python).
+*   **Cloud Storage:**
+    *   AWS S3 (for storing uploaded and processed image files).
 *   **Considerations:** Strategic decisions on client-side vs. backend processing for different AI effects to balance performance, cost, and user experience.
 
 ## Current State of Implementation
@@ -121,6 +127,56 @@ Steps:
 Example: `export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-file.json"`
 
 Ensure the backend application has this environment variable set when it starts.
+
+### AWS S3 for Cloud Storage
+
+The application utilizes AWS S3 for storing all uploaded original images and any images processed or enhanced through the platform. This cloud-based storage ensures scalability and reliability.
+
+**Required Environment Variables:**
+
+To connect to your AWS S3 bucket, the following environment variables must be set in the backend application's environment:
+
+*   `AWS_S3_BUCKET_NAME`: The name of your S3 bucket (e.g., `my-hisaycheese-images`).
+*   `AWS_S3_REGION`: The AWS region where your S3 bucket is located (e.g., `us-east-1`).
+*   `AWS_ACCESS_KEY_ID`: Your AWS access key ID.
+*   `AWS_SECRET_ACCESS_KEY`: Your AWS secret access key.
+
+These settings are loaded by `config.py`. Ensure these variables are configured correctly for the application to interact with S3. You can set these directly in your shell, or use a `.env` file management system appropriate for your deployment.
+
+**API Responses and Pre-signed URLs:**
+
+When images are uploaded or processed, API endpoints that return image locations (e.g., `presigned_url` in the upload response, `processed_image_path` in enhancement responses) will provide AWS S3 pre-signed URLs. These URLs grant temporary, secure access to the image files stored in the private S3 bucket.
+
+**Local Development with S3 Mocking:**
+
+For local development and testing, S3 interactions are typically mocked (e.g., using `moto` as implemented in the project's tests). When running the application locally with such mocks, you might still need to set the S3-related environment variables (e.g., `AWS_S3_BUCKET_NAME`, `AWS_S3_REGION`, and dummy credentials like `AWS_ACCESS_KEY_ID="testing"`, `AWS_SECRET_ACCESS_KEY="testing"`) for the `StorageService` to initialize correctly, even though `moto` will intercept the actual S3 calls. Refer to `config.py` for how these are loaded and for any default fallback values (though for credentials, real or mock values via environment variables are expected for S3 functionality).
+
+### AWS SES for Email Sending
+
+The application uses AWS Simple Email Service (SES) for sending transactional emails, such as account verification emails.
+
+**Required Environment Variables:**
+
+*   `AWS_SES_REGION`: The AWS region where your SES service is configured (e.g., `us-east-1`). This can often be the same as your S3 region.
+*   `AWS_SES_SENDER_EMAIL`: The email address that will appear as the sender (e.g., `noreply@hisaycheese.com`). **This email address must be verified in your AWS SES console for the specified region.**
+*   `FRONTEND_URL`: The base URL of your frontend application (e.g., `http://localhost:3000` or `https://hisaycheese.com`). This is used to generate links in emails, such as the verification link.
+
+The existing AWS credentials (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`) configured for S3 are also used by `boto3` for SES, assuming the IAM permissions are correctly set up. These settings are loaded by `config.py`.
+
+**Local Development with SES Mocking:**
+
+Similar to S3, SES calls are mocked using `moto` during automated tests. For local manual testing where you might not want to send real emails, ensure the application can handle the `EmailService` potentially not sending emails (e.g., if credentials aren't fully set up or the service is conditionally disabled). The `FRONTEND_URL` should be set appropriately in your local environment if you intend to click generated links that point to your local frontend instance.
+
+## User Account Verification
+
+New users registering with HiSayCheese will need to verify their email address to fully activate their account and access all features.
+
+1.  **Registration:** Upon successful registration, the system automatically sends a verification email to the address provided. This email is sent asynchronously to ensure a fast response from the registration API endpoint.
+2.  **Verification Email:** The email contains a unique, time-sensitive verification link.
+3.  **Verification Process:** Clicking this link directs the user to an API endpoint (`GET /api/auth/verify-email?token=<token>`) that validates the token.
+4.  **Access Granted:** If the token is valid and not expired, the user's email is marked as verified in the database. They can then log in and access all protected API resources and application features. If the token is invalid or expired, an appropriate error message is displayed.
+
+Until the email is verified, access to certain protected API endpoints will be restricted.
 
 ## Project Naming
 

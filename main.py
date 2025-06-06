@@ -3,6 +3,7 @@ import uuid
 import magic
 import os # Added os import
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status # Added status
+import json # Added for EnhancementHistory
 from sqlalchemy.orm import Session
 from typing import Optional # Added Optional
 from pydantic import BaseModel # Added BaseModel import
@@ -20,6 +21,9 @@ from db import crud
 from models import models # This imports the models module
 # We need ImageCreate and ImageSchema for type hinting and response_model
 # from models.models import ImageCreate, ImageSchema # More specific imports
+# Corrected import for models to include User, EnhancementHistoryBase, ImageCreate
+from models import models # This imports the models module
+from models.models import User, EnhancementHistoryBase, ImageCreate # Added User, EnhancementHistoryBase, ImageCreate
 import logging # Added logging
 from typing import List # Added for FaceDetection models
 
@@ -30,6 +34,7 @@ from services.image_processing import apply_enhancements, ImageProcessingError #
 
 from routers import auth as auth_router # Import the auth router
 from routers import users as users_router # Import the users router
+from auth_utils import get_current_user # Added for current_user dependency
 
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
@@ -565,9 +570,10 @@ async def get_auto_enhancement_parameters(
 @app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
 async def apply_image_enhancements_endpoint(
     request: ImageEnhancementRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user) # Added current_user
 ):
-    logger.info(f"Received request to apply enhancements for image_id: {request.image_id}")
+    logger.info(f"Received request to apply enhancements for image_id: {request.image_id} by user: {current_user.id}") # Log user
 
     db_image = crud.get_image(db, image_id=request.image_id)
     if not db_image:
@@ -657,10 +663,56 @@ async def apply_image_enhancements_endpoint(
         logger.info(f"Apply Enhancement: Saving processed image for id {request.image_id} to {processed_image_filepath}")
         processed_pil_image.save(processed_image_filepath, format='PNG')
 
-        # For now, processed_image_id is None as we are not creating a new DB record.
+        # Initialize variables for processed image record and ID
+        db_processed_image_record = None
+        processed_image_id_for_response = None
+
+        try:
+            # 3. Create an Image record for the processed image
+            processed_image_filesize = os.path.getsize(processed_image_filepath)
+            processed_image_width, processed_image_height = processed_pil_image.size
+            processed_image_format = processed_pil_image.format if processed_pil_image.format else 'PNG'
+
+
+            image_create_data = ImageCreate(
+                filename=new_filename,
+                filepath=processed_image_filepath,
+                filesize=processed_image_filesize,
+                mimetype='image/png', # Explicitly PNG as we save in this format
+                width=processed_image_width,
+                height=processed_image_height,
+                format=processed_image_format
+                # exif_orientation and color_profile can be None or copied if available/relevant
+            )
+            db_processed_image_record = crud.create_image(
+                db=db,
+                image=image_create_data,
+                width=image_create_data.width,
+                height=image_create_data.height,
+                format=image_create_data.format
+            )
+            processed_image_id_for_response = db_processed_image_record.id
+            logger.info(f"Apply Enhancement: Created DB record for processed image with ID: {db_processed_image_record.id}")
+
+            # 5. Create EnhancementHistory record
+            parameters_json_str = json.dumps(request.parameters.model_dump())
+            history_create_data = EnhancementHistoryBase(
+                original_image_id=db_image.id, # original image ID
+                processed_image_id=db_processed_image_record.id, # new processed image ID
+                parameters_json=parameters_json_str
+            )
+            crud.create_enhancement_history(db=db, history_data=history_create_data, user_id=current_user.id)
+            logger.info(f"Apply Enhancement: Enhancement history record created for user {current_user.id}, original image {db_image.id}, processed image {db_processed_image_record.id}")
+
+        except Exception as db_error:
+            # Log DB errors but don't fail the entire request if file was saved
+            logger.error(f"Apply Enhancement: Error during DB operations (saving processed image record or history) for original image id {request.image_id}: {db_error}", exc_info=True)
+            # The processed_image_id_for_response might be None if create_image failed, or set if history creation failed.
+            # This is acceptable as per error handling guidelines (prioritize returning image path).
+
         return ProcessedImageResponse(
             original_image_id=request.image_id,
-            processed_image_id=None,
+            processed_image_id=processed_image_id_for_response, # This will be None if DB op failed before setting it
             processed_image_path=processed_image_filepath,
             message="Image enhancements applied and saved successfully."
         )

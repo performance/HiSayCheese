@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy import Column, DateTime, Integer, String, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
 from pydantic import BaseModel, EmailStr
@@ -49,6 +49,32 @@ class UserCreate(UserBase):
     password: str # min_length=8 will be handled by endpoint logic
 
 class UserSchema(UserBase):
+    id: uuid.UUID
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class EnhancementHistory(Base):
+    __tablename__ = "enhancement_history"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    original_image_id = Column(UUID(as_uuid=True), ForeignKey("images.id"), nullable=False)
+    processed_image_id = Column(UUID(as_uuid=True), ForeignKey("images.id"), nullable=True)
+    parameters_json = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Pydantic schemas for EnhancementHistory
+class EnhancementHistoryBase(BaseModel):
+    user_id: uuid.UUID
+    original_image_id: uuid.UUID
+    processed_image_id: Optional[uuid.UUID] = None
+    parameters_json: str
+
+class EnhancementHistorySchema(EnhancementHistoryBase):
     id: uuid.UUID
     created_at: datetime
 

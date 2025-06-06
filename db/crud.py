@@ -10,8 +10,8 @@ from models import models # Updated import to access Image model and Pydantic sc
 # or if .database still correctly provides it (which it does after previous subtask)
 
 # Let's adjust imports for clarity and correctness based on previous steps
-from models.models import Number, Image, ImageCreate, ImageSchema, User, UserCreate
-from typing import Optional # Added for Optional type hint
+from models.models import Number, Image, ImageCreate, ImageSchema, User, UserCreate, EnhancementHistory, EnhancementHistoryBase
+from typing import Optional, List # Added for Optional type hint
 from auth_utils import hash_password
 
 def get_number(db: Session):
@@ -80,3 +80,20 @@ def create_user(db: Session, user: UserCreate) -> User:
 
 def get_user_by_id(db: Session, user_id: uuid.UUID) -> Optional[User]:
     return db.query(User).filter(User.id == user_id).first()
+
+
+# Functions for EnhancementHistory model
+def create_enhancement_history(db: Session, history_data: EnhancementHistoryBase, user_id: uuid.UUID) -> EnhancementHistory:
+    db_history = EnhancementHistory(
+        user_id=user_id,
+        original_image_id=history_data.original_image_id,
+        processed_image_id=history_data.processed_image_id,
+        parameters_json=history_data.parameters_json
+    )
+    db.add(db_history)
+    db.commit()
+    db.refresh(db_history)
+    return db_history
+
+def get_enhancement_history_by_user(db: Session, user_id: uuid.UUID, skip: int = 0, limit: int = 10) -> List[EnhancementHistory]:
+    return db.query(EnhancementHistory).filter(EnhancementHistory.user_id == user_id).order_by(EnhancementHistory.created_at.desc()).offset(skip).limit(limit).all()

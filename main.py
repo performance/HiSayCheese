@@ -28,6 +28,8 @@ from services.image_quality import analyze_image_quality # New import
 from services.auto_enhancement import calculate_auto_enhancements # New import for auto enhancement
 from services.image_processing import apply_enhancements, ImageProcessingError # New import for applying enhancements
 
+from routers import auth as auth_router # Import the auth router
+
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
     is_approved: bool
@@ -89,6 +91,7 @@ class ProcessedImageResponse(BaseModel):
     error: Optional[str] = None
 
 app = FastAPI()
+app.include_router(auth_router.router) # Include the auth router
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO)

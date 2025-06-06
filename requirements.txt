@@ -8,3 +8,5 @@ Pillow>=9.0.0
 opencv-python
 numpy
 mediapipe
+passlib[bcrypt]
+email-validator

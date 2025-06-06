@@ -10,8 +10,9 @@ from models import models # Updated import to access Image model and Pydantic sc
 # or if .database still correctly provides it (which it does after previous subtask)
 
 # Let's adjust imports for clarity and correctness based on previous steps
-from models.models import Number, Image, ImageCreate, ImageSchema
+from models.models import Number, Image, ImageCreate, ImageSchema, User, UserCreate
 from typing import Optional # Added for Optional type hint
+from auth_utils import hash_password
 
 def get_number(db: Session):
     return db.query(models.Number).first() # Adjusted to use models.Number
@@ -64,3 +65,15 @@ def create_image(
 
 def get_image(db: Session, image_id: uuid.UUID) -> models.Image | None:
     return db.query(models.Image).filter(models.Image.id == image_id).first()
+
+# Functions for User model
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    return db.query(User).filter(User.email == email).first()
+
+def create_user(db: Session, user: UserCreate) -> User:
+    hashed_pass = hash_password(user.password)
+    db_user = User(email=user.email, hashed_password=hashed_pass)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user

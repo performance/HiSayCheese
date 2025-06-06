@@ -164,6 +164,7 @@ class ImageCreate(BaseModel):
 class ImageSchema(ImageCreate): # Inherits fields from ImageCreate
     id: uuid.UUID
     created_at: datetime
+    presigned_url: Optional[str] = None # Added new field for presigned URL
     # width, height, format, etc. inherit constraints from ImageCreate via inheritance
 
     class Config:

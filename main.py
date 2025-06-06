@@ -48,6 +48,8 @@ from services.face_detection import detect_faces # Added for face detection endp
 from services.image_quality import analyze_image_quality # New import
 from services.auto_enhancement import calculate_auto_enhancements # New import for auto enhancement
 from services.image_processing import apply_enhancements, ImageProcessingError # New import for applying enhancements
+from services.storage_service import StorageService # Import StorageService
+from io import BytesIO # Import BytesIO
 
 from routers import auth as auth_router # Import the auth router
 from routers import users as users_router # Import the users router
@@ -353,15 +355,30 @@ app.include_router(users_router.router) # Include the users router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Instantiate StorageService
+try:
+    storage_service = StorageService()
+    logger.info("StorageService initialized successfully.")
+except HTTPException as e:
+    logger.error(f"Failed to initialize StorageService: {e.detail}")
+    # Depending on policy, we might re-raise or exit, or allow app to run with degraded functionality.
+    # For now, let it proceed and fail on operations if storage_service is not available.
+    # A more robust approach might involve a health check for S3 connectivity.
+    storage_service = None # Ensure it's None if initialization fails
+except Exception as e:
+    logger.error(f"An unexpected error occurred during StorageService initialization: {e}")
+    storage_service = None # Ensure it's None
+
+
 # Constants
-UPLOAD_DIR = "uploads/images/"
-PROCESSED_UPLOAD_DIR = "uploads/processed/" # Directory for processed images
 ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
 MIME_TYPE_TO_EXTENSION = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/webp": ".webp",
 }
+# Define a temporary directory for local processing if needed
+TEMP_PROCESSING_DIR = "/tmp/image_processing/"
 MAX_FILE_SIZE_MB = 15 # Max for image files (handled by endpoint)
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # MAX_REQUEST_BODY_SIZE is defined above for general requests
@@ -557,7 +574,6 @@ async def upload_image(request: Request, file: UploadFile = File(...), db: Sessi
     # For now, let's assume we might want to log/store info about rejected files without saving them,
     # or save them to a different location. The current setup saves the file first, then decides.
     # Let's adjust to create ImageCreate with moderation result first.
-    # os.makedirs(UPLOAD_DIR, exist_ok=True) # Moved down
 
     # Sanitize the filename before using it
     sanitized_filename = secure_filename(file.filename)
@@ -618,31 +634,36 @@ async def upload_image(request: Request, file: UploadFile = File(...), db: Sessi
             detail=moderation_result.rejection_reason
         )
     else:
-        # Approved: Ensure UPLOAD_DIR exists, generate filename, save file, update filepath
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        unique_filename_base = uuid.uuid4().hex
-        unique_filename = f"{unique_filename_base}{file_extension}"
-        server_filepath = os.path.join(UPLOAD_DIR, unique_filename)
+        # Approved: Upload to S3
+        if not storage_service:
+            logger.error("StorageService not available for image upload.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image storage service is not configured.")
+
+        s3_object_key = f"original_images/{uuid.uuid4().hex}{file_extension}"
 
         try:
-            with open(server_filepath, "wb") as f:
-                f.write(contents)
-            logger.info(f"Approved image saved to {server_filepath}")
-            image_data_to_create.filepath = server_filepath # Update filepath for approved image
-        except IOError as e:
-            logger.error(f"Could not save approved file to {server_filepath}: {e}")
-            # This is a server error after approval.
-            # The image record will NOT be created in the DB if saving fails.
-            # This is different from previous: if create_image was called before saving file.
-            # Current: moderate -> [if approved] save file -> create_image record.
-            # This seems more robust.
+            # Use BytesIO to treat the 'contents' (bytes) as a file-like object for upload_fileobj
+            storage_service.upload_file(
+                file_obj=BytesIO(contents),
+                object_key=s3_object_key,
+                content_type=actual_content_type,
+                acl="private" # Or your desired ACL
+            )
+            logger.info(f"Approved image uploaded to S3 with key: {s3_object_key}")
+            image_data_to_create.filepath = s3_object_key # Update filepath to S3 object key
+        except HTTPException as e: # Catch HTTPException from storage_service
+            logger.error(f"S3 upload failed: {e.detail}")
+            # Re-raise the HTTPException from storage_service
+            raise e
+        except Exception as e: # Catch any other unexpected errors during upload
+            logger.error(f"An unexpected error occurred during S3 upload: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Could not save file after approval: {e}",
+                detail=f"Could not upload file to S3: {e}",
             )
 
         # Ensure rejection_reason is explicitly None for approved images in the database
-        image_data_to_create.rejection_reason = None # This is already part of image_data_to_create
+        image_data_to_create.rejection_reason = None
 
         # Pass all required fields to crud.create_image
         db_image = crud.create_image(
@@ -654,7 +675,33 @@ async def upload_image(request: Request, file: UploadFile = File(...), db: Sessi
             exif_orientation=image_data_to_create.exif_orientation,
             color_profile=image_data_to_create.color_profile
         )
-        return db_image
+
+        presigned_url_for_response = None
+        if storage_service and db_image.filepath: # db_image.filepath is the S3 key
+            try:
+                presigned_url_for_response = storage_service.generate_presigned_url(db_image.filepath)
+                logger.info(f"Generated presigned URL for new upload {db_image.filepath}: {presigned_url_for_response}")
+            except Exception as e_url:
+                logger.error(f"Failed to generate presigned URL for new upload {db_image.filepath}: {e_url}", exc_info=True)
+                # Non-critical error, proceed without presigned_url if generation fails
+
+        # Construct response dictionary matching ImageSchema fields + new presigned_url field
+        response_data = {
+            "id": db_image.id,
+            "filename": db_image.filename,
+            "filepath": db_image.filepath, # This remains the S3 key
+            "filesize": db_image.filesize,
+            "mimetype": db_image.mimetype,
+            "width": db_image.width,
+            "height": db_image.height,
+            "format": db_image.format,
+            "exif_orientation": db_image.exif_orientation,
+            "color_profile": db_image.color_profile,
+            "rejection_reason": db_image.rejection_reason,
+            "created_at": db_image.created_at,
+            "presigned_url": presigned_url_for_response
+        }
+        return response_data # FastAPI will validate this against ImageSchema
 
 # Endpoint for Face Detection
 @app.get("/api/analysis/faces/{image_id}", response_model=FaceDetectionResponse)
@@ -666,36 +713,56 @@ async def get_face_detections(request: Request, image_id: uuid.UUID, db: Session
         raise HTTPException(status_code=404, detail=f"Image with id {image_id} not found.")
 
     if not db_image.filepath:
-        # This case might occur if an image was recorded in DB but file saving failed
-        # or if it's a rejected image that wasn't saved (e.g. content moderation failed)
-        logger.info(f"Filepath for image id {image_id} not available. Image status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
-        raise HTTPException(status_code=404, detail=f"Filepath for image id {image_id} not available. The image might not have been processed or saved correctly.")
+        logger.info(f"Filepath (S3 key) for image id {image_id} not available. Status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"S3 key for image id {image_id} not available.")
 
+    if not storage_service:
+        logger.error("StorageService not available for face detection.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image storage service is not configured.")
+
+    temp_local_path = None
     try:
-        logger.info(f"Attempting face detection for image id {image_id} at path: {db_image.filepath}")
-        detected_faces_data = detect_faces(db_image.filepath)
+        os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True)
+        # Use a unique name for the temp file, incorporating original filename if desired (sanitize it)
+        # For simplicity, using UUID and base of S3 key.
+        base_s3_key = os.path.basename(db_image.filepath)
+        temp_local_path = os.path.join(TEMP_PROCESSING_DIR, f"{uuid.uuid4().hex}_{base_s3_key}")
 
-        response_faces = []
-        for face_data in detected_faces_data:
-            response_faces.append(FaceBoundingBox(box=face_data['box'], confidence=face_data.get('confidence')))
+        logger.info(f"Attempting to download S3 object {db_image.filepath} to {temp_local_path} for face detection (image_id: {image_id})")
+        storage_service.download_file(object_key=db_image.filepath, destination_path=temp_local_path)
+
+        logger.info(f"Attempting face detection for image id {image_id} using temporary local file: {temp_local_path}")
+        detected_faces_data = detect_faces(temp_local_path)
+
+        response_faces = [FaceBoundingBox(box=f['box'], confidence=f.get('confidence')) for f in detected_faces_data]
 
         if not response_faces:
-            logger.info(f"No faces detected for image id {image_id} using local detection.")
-            return FaceDetectionResponse(faces=[], image_id=db_image.id, message="No faces detected.") # Use db_image.id (UUID)
+            logger.info(f"No faces detected for image id {image_id} (S3 key: {db_image.filepath}).")
+            return FaceDetectionResponse(faces=[], image_id=db_image.id, message="No faces detected.")
 
-        logger.info(f"Successfully detected {len(response_faces)} faces for image id {image_id} using local detection.")
-        return FaceDetectionResponse(faces=response_faces, image_id=db_image.id) # Use db_image.id (UUID)
+        logger.info(f"Successfully detected {len(response_faces)} faces for image id {image_id} (S3 key: {db_image.filepath}).")
+        return FaceDetectionResponse(faces=response_faces, image_id=db_image.id)
 
-    except FileNotFoundError:
-        logger.error(f"File not found for image id {image_id} at path: {db_image.filepath} during face detection attempt.")
-        raise HTTPException(status_code=404, detail=f"Image file not found for id {image_id}. It may have been moved or deleted after upload.")
+    except HTTPException as e: # Catch exceptions from storage_service.download_file
+        logger.error(f"S3 download failed for key {db_image.filepath} (image_id: {image_id}): {e.detail}")
+        # Re-raise the HTTPException (e.g., 404 if S3 object not found, 500 for other S3 errors)
+        raise e
+    except FileNotFoundError: # Should not happen if download_file is robust, but good for local file issues with detect_faces
+        logger.error(f"Temporary local file {temp_local_path} not found after supposed download for image id {image_id}.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process image locally after S3 download.")
     except ValueError as e:
-        # This can be caught if detect_faces raises it due to image loading issues (e.g. invalid image file)
-        logger.error(f"Error processing image id {image_id} with local face detection (ValueError): {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing image id {image_id}: Invalid image file or format. Details: {str(e)}")
+        logger.error(f"Error processing image {temp_local_path} (from S3 key {db_image.filepath}, image_id {image_id}) with face detection (ValueError): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Invalid image file or format from S3: {str(e)}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred while detecting faces for image id {image_id} using local detection: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during face detection.")
+        logger.error(f"Unexpected error during face detection for image_id {image_id} (S3 key: {db_image.filepath}): {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error during face detection.")
+    finally:
+        if temp_local_path and os.path.exists(temp_local_path):
+            try:
+                os.remove(temp_local_path)
+                logger.info(f"Cleaned up temporary file: {temp_local_path}")
+            except Exception as e_clean:
+                logger.error(f"Failed to clean up temporary file {temp_local_path}: {e_clean}")
 
 
 @app.get("/api/analysis/quality/{image_id}", response_model=ImageQualityAnalysisResponse)
@@ -706,24 +773,27 @@ async def get_image_quality_analysis(request: Request, image_id: uuid.UUID, db: 
         logger.warning(f"Image quality analysis request for non-existent image_id: {image_id}")
         raise HTTPException(status_code=404, detail=f"Image with id {image_id} not found.")
 
-    if not db_image.filepath:
-        logger.info(f"Filepath for image id {image_id} not available for quality analysis. Image status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
-        raise HTTPException(status_code=404, detail=f"Filepath for image id {image_id} not available. The image might not have been processed or saved correctly.")
+    if not db_image.filepath: # Now an S3 key
+        logger.info(f"S3 key for image id {image_id} not available for quality analysis. Status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"S3 key for image id {image_id} not available.")
 
-    if not os.path.exists(db_image.filepath): # Check if file exists before analysis
-        logger.error(f"File not found for image id {image_id} at path: {db_image.filepath} during quality analysis attempt.")
-        raise HTTPException(status_code=404, detail=f"Image file not found at path {db_image.filepath}. It may have been moved or deleted.")
+    if not storage_service:
+        logger.error("StorageService not available for image quality analysis.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image storage service is not configured.")
 
+    temp_local_path = None
     try:
-        logger.info(f"Attempting image quality analysis for image id {image_id} at path: {db_image.filepath}")
+        os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True)
+        base_s3_key = os.path.basename(db_image.filepath)
+        temp_local_path = os.path.join(TEMP_PROCESSING_DIR, f"{uuid.uuid4().hex}_{base_s3_key}")
 
-        # Call the analysis function from the service
-        quality_data = analyze_image_quality(db_image.filepath)
+        logger.info(f"Attempting to download S3 object {db_image.filepath} to {temp_local_path} for quality analysis (image_id: {image_id})")
+        storage_service.download_file(object_key=db_image.filepath, destination_path=temp_local_path)
 
-        metrics = ImageQualityMetrics(
-            brightness=quality_data["brightness"],
-            contrast=quality_data["contrast"]
-        )
+        logger.info(f"Attempting image quality analysis for image id {image_id} using temporary file: {temp_local_path}")
+        quality_data = analyze_image_quality(temp_local_path)
+
+        metrics = ImageQualityMetrics(brightness=quality_data["brightness"], contrast=quality_data["contrast"])
 
         return ImageQualityAnalysisResponse(
             image_id=db_image.id,
@@ -732,15 +802,25 @@ async def get_image_quality_analysis(request: Request, image_id: uuid.UUID, db: 
             message="Image quality analysis successful."
         )
 
-    except FileNotFoundError: # Should be caught by the os.path.exists check, but good to have
-        logger.error(f"File not found for image id {image_id} at path: {db_image.filepath} during quality analysis.")
-        raise HTTPException(status_code=404, detail=f"Image file not found for id {image_id} during analysis.")
+    except HTTPException as e: # From storage_service.download_file
+        logger.error(f"S3 download failed for key {db_image.filepath} (image_id: {image_id}) during quality analysis: {e.detail}")
+        raise e
+    except FileNotFoundError:
+        logger.error(f"Temporary local file {temp_local_path} not found after download for image id {image_id} (quality analysis).")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process image locally after S3 download for quality analysis.")
     except ValueError as e:
-        logger.error(f"Error processing image id {image_id} with quality analysis (ValueError): {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing image id {image_id}: Invalid image file or format. Details: {str(e)}")
+        logger.error(f"Error processing image {temp_local_path} (from S3 key {db_image.filepath}, image_id {image_id}) with quality analysis (ValueError): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Invalid image file or format from S3 for quality analysis: {str(e)}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred while analyzing image quality for id {image_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during image quality analysis.")
+        logger.error(f"Unexpected error during image quality analysis for image_id {image_id} (S3 key: {db_image.filepath}): {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error during image quality analysis.")
+    finally:
+        if temp_local_path and os.path.exists(temp_local_path):
+            try:
+                os.remove(temp_local_path)
+                logger.info(f"Cleaned up temporary file: {temp_local_path} (quality analysis)")
+            except Exception as e_clean:
+                logger.error(f"Failed to clean up temporary file {temp_local_path} (quality analysis): {e_clean}")
 
 
 @app.get("/api/enhancement/auto/{image_id}", response_model=AutoEnhancementResponse)
@@ -758,58 +838,53 @@ async def get_auto_enhancement_parameters(
         logger.warning(f"Image not found in DB for id: {image_id}")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image with id {image_id} not found.")
 
-    if not db_image.filepath:
-        logger.warning(f"Filepath not available for image_id: {image_id}. Image status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Filepath for image id {image_id} not available. Image may not have been processed or saved.")
+    if not db_image.filepath: # S3 key
+        logger.warning(f"S3 key not available for image_id: {image_id}. Status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"S3 key for image id {image_id} not available.")
 
-    if not os.path.exists(db_image.filepath):
-        logger.error(f"Image file not found at path: {db_image.filepath} for image_id: {image_id}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image file not found at path {db_image.filepath}. It may have been moved or deleted.")
+    if not storage_service:
+        logger.error("StorageService not available for auto enhancement.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image storage service is not configured.")
 
     if db_image.width is None or db_image.height is None:
-        logger.error(f"Image dimensions are missing for image_id: {image_id}. Width: {db_image.width}, Height: {db_image.height}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Image dimensions (width, height) missing for image id {image_id}. Cannot perform enhancements.")
+        logger.error(f"Image dimensions (width, height) missing for image_id: {image_id}.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Image dimensions missing for image id {image_id}.")
     image_dimensions = (db_image.width, db_image.height)
 
-    face_results = []
+    temp_local_path = None
     try:
-        logger.info(f"Performing face detection for image_id: {image_id} at path: {db_image.filepath}")
-        face_results = detect_faces(db_image.filepath) # Returns a list of dicts
-    except FileNotFoundError: # Should be caught by os.path.exists, but good as a safeguard
-        logger.error(f"Face detection: File not found for image_id: {image_id} at path: {db_image.filepath}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image file not found during face detection for id {image_id}.")
-    except ValueError as e: # If detect_faces raises ValueError for bad image
-        logger.error(f"Face detection: Error processing image_id {image_id} (ValueError): {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing image for face detection (id: {image_id}): {str(e)}")
-    except Exception as e:
-        logger.error(f"Face detection: Unexpected error for image_id {image_id}: {e}", exc_info=True)
-        # Depending on policy, we might allow proceeding without face_results or raise 500.
-        # For now, let's proceed, calculate_auto_enhancements should handle empty face_results.
-        # If it's critical, raise HTTPException here. For now, it defaults to empty list.
-        pass # Proceed with empty face_results
+        os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True)
+        base_s3_key = os.path.basename(db_image.filepath)
+        temp_local_path = os.path.join(TEMP_PROCESSING_DIR, f"{uuid.uuid4().hex}_{base_s3_key}")
 
-    quality_results = {}
-    try:
-        logger.info(f"Performing image quality analysis for image_id: {image_id} at path: {db_image.filepath}")
-        quality_results = analyze_image_quality(db_image.filepath) # Returns a dict
-    except FileNotFoundError: # Should be caught by os.path.exists
-        logger.error(f"Quality analysis: File not found for image_id: {image_id} at path: {db_image.filepath}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Image file not found during quality analysis for id {image_id}.")
-    except ValueError as e: # If analyze_image_quality raises ValueError for bad image
-        logger.error(f"Quality analysis: Error processing image_id {image_id} (ValueError): {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing image for quality analysis (id: {image_id}): {str(e)}")
-    except Exception as e:
-        logger.error(f"Quality analysis: Unexpected error for image_id {image_id}: {e}", exc_info=True)
-        # If quality_results are essential and cannot be defaulted in calculate_auto_enhancements, raise 500.
-        # calculate_auto_enhancements has defaults if keys are missing.
-        # So, we can proceed with potentially empty quality_results or partial data.
-        pass # Proceed with potentially empty/partial quality_results
+        logger.info(f"Auto-Enhance: Downloading S3 object {db_image.filepath} to {temp_local_path} for image_id: {image_id}")
+        storage_service.download_file(object_key=db_image.filepath, destination_path=temp_local_path)
 
+        face_results = []
+        try:
+            logger.info(f"Auto-Enhance: Performing face detection for image_id: {image_id} using {temp_local_path}")
+            face_results = detect_faces(temp_local_path)
+        except ValueError as e: # Bad image for face detection
+            logger.error(f"Auto-Enhance: Face detection ValueError for {temp_local_path} (image_id: {image_id}): {e}")
+            # Proceed with empty face_results, or raise if faces are critical for this step
+        except Exception as e:
+            logger.error(f"Auto-Enhance: Unexpected error during face detection for {temp_local_path} (image_id: {image_id}): {e}", exc_info=True)
+            # Proceed with empty face_results
 
-    logger.info(f"Calculating auto enhancement parameters for image_id: {image_id} with mode: {mode}")
-    try:
+        quality_results = {}
+        try:
+            logger.info(f"Auto-Enhance: Performing image quality analysis for image_id: {image_id} using {temp_local_path}")
+            quality_results = analyze_image_quality(temp_local_path)
+        except ValueError as e: # Bad image for quality analysis
+            logger.error(f"Auto-Enhance: Quality analysis ValueError for {temp_local_path} (image_id: {image_id}): {e}")
+            # Proceed with empty/partial quality_results
+        except Exception as e:
+            logger.error(f"Auto-Enhance: Unexpected error during quality analysis for {temp_local_path} (image_id: {image_id}): {e}", exc_info=True)
+            # Proceed with empty/partial quality_results
+
+        logger.info(f"Auto-Enhance: Calculating parameters for image_id: {image_id}, mode: {mode}, using data from {temp_local_path}")
         enhancement_params_dict = calculate_auto_enhancements(
-            image_path=db_image.filepath,
+            image_path=temp_local_path, # Use downloaded temp path
             image_dimensions=image_dimensions,
             face_detection_results=face_results,
             image_quality_results=quality_results,
@@ -817,15 +892,28 @@ async def get_auto_enhancement_parameters(
         )
         enhancement_params_model = EnhancementParameters(**enhancement_params_dict)
 
-        logger.info(f"Successfully calculated enhancement parameters for image_id: {image_id}")
+        logger.info(f"Auto-Enhance: Successfully calculated parameters for image_id: {image_id}")
         return AutoEnhancementResponse(
             image_id=image_id,
             enhancement_parameters=enhancement_params_model,
             message="Auto enhancement parameters calculated successfully."
         )
-    except Exception as e:
-        logger.error(f"Error calculating auto enhancement parameters for image_id {image_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate auto enhancement parameters due to an internal error.")
+    except HTTPException as e: # From storage_service.download_file
+        logger.error(f"Auto-Enhance: S3 download failed for key {db_image.filepath} (image_id: {image_id}): {e.detail}")
+        raise e
+    except FileNotFoundError: # If temp_local_path is somehow not found after download (should not happen)
+        logger.error(f"Auto-Enhance: Temp file {temp_local_path} not found after download for image_id: {image_id}.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process image locally after S3 download for auto-enhancement.")
+    except Exception as e: # Catch-all for other errors, including calculate_auto_enhancements
+        logger.error(f"Auto-Enhance: Error calculating parameters for image_id {image_id} (S3 key: {db_image.filepath}): {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate auto enhancement parameters.")
+    finally:
+        if temp_local_path and os.path.exists(temp_local_path):
+            try:
+                os.remove(temp_local_path)
+                logger.info(f"Auto-Enhance: Cleaned up temporary file: {temp_local_path}")
+            except Exception as e_clean:
+                logger.error(f"Auto-Enhance: Failed to clean up temporary file {temp_local_path}: {e_clean}")
 
 @app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
 @limiter.limit(get_dynamic_rate_limit)
@@ -854,46 +942,46 @@ async def apply_image_enhancements_endpoint(
         return ProcessedImageResponse(
             original_image_id=request.image_id,
             message="Failed to apply enhancements.",
-            error=f"Filepath for image id {request.image_id} not available."
+            error=f"S3 key for image id {request.image_id} not available."
         )
 
-    if not os.path.exists(db_image.filepath):
-        logger.error(f"Apply Enhancement: Image file not found at path: {db_image.filepath} for image_id: {request.image_id}")
+    if not storage_service: # Ensure storage_service is available earlier
+        logger.error("StorageService not available for applying enhancements.")
         return ProcessedImageResponse(
             original_image_id=request.image_id,
             message="Failed to apply enhancements.",
-            error=f"Image file not found at path {db_image.filepath}."
+            error="Image storage service is not configured."
         )
 
-    face_results = []
-    # Perform face detection if face smoothing or other face-dependent features are requested
-    # For simplicity, we run it if smoothing intensity is positive.
-    # Could also run if auto-crop based on faces is a parameter (not currently the case for manual apply).
-    if request.parameters.face_smooth_intensity > 0: # or other face-dependent params
-        try:
-            logger.info(f"Apply Enhancement: Performing face detection for image_id: {request.image_id} for smoothing.")
-            face_results = detect_faces(db_image.filepath)
-        except FileNotFoundError:
-             logger.error(f"Apply Enhancement: File not found for face detection: {db_image.filepath}")
-             return ProcessedImageResponse(
-                original_image_id=request.image_id,
-                message="Failed to apply enhancements.",
-                error="Original image file not found during face detection."
-            )
-        except Exception as e:
-            logger.error(f"Apply Enhancement: Error during face detection for image_id {request.image_id}: {e}", exc_info=True)
-            # Decide if this is fatal. For now, proceed with no faces.
-            face_results = []
-
-
+    temp_original_image_path = None
     processed_pil_image: Optional[PILImage.Image] = None
     try:
-        logger.info(f"Apply Enhancement: Calling apply_enhancements service for image_id: {request.image_id}")
+        # Download original image from S3 to a temporary path
+        os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True)
+        base_s3_key_original = os.path.basename(db_image.filepath)
+        temp_original_image_path = os.path.join(TEMP_PROCESSING_DIR, f"original_{uuid.uuid4().hex}_{base_s3_key_original}")
+
+        logger.info(f"Apply Enhancement: Downloading original image {db_image.filepath} to {temp_original_image_path} for image_id: {request.image_id}")
+        storage_service.download_file(object_key=db_image.filepath, destination_path=temp_original_image_path)
+
+        face_results = []
+        if request.parameters.face_smooth_intensity > 0:
+            try:
+                logger.info(f"Apply Enhancement: Performing face detection on {temp_original_image_path} for image_id: {request.image_id}")
+                face_results = detect_faces(temp_original_image_path)
+            except Exception as e_face:
+                logger.error(f"Apply Enhancement: Error during face detection for {temp_original_image_path} (image_id {request.image_id}): {e_face}", exc_info=True)
+                face_results = [] # Proceed without faces if detection fails
+
+        logger.info(f"Apply Enhancement: Calling apply_enhancements service for image_id: {request.image_id} using {temp_original_image_path}")
         processed_pil_image = apply_enhancements(
-            image_path=db_image.filepath,
-            params=request.parameters.model_dump(), # Convert Pydantic model to dict
+            image_path=temp_original_image_path, # Use temp path of downloaded original image
+            params=request.parameters.model_dump(),
             face_detection_results=face_results
         )
+    except HTTPException as e_s3_download: # Catch S3 download errors specifically
+        logger.error(f"Apply Enhancement: S3 download failed for {db_image.filepath} (image_id {request.image_id}): {e_s3_download.detail}")
+        return ProcessedImageResponse(original_image_id=request.image_id, message="Failed to apply enhancements.", error=f"Could not retrieve original image: {e_s3_download.detail}")
     except ImageProcessingError as e:
         logger.error(f"Apply Enhancement: ImageProcessingError for image_id {request.image_id}: {e}", exc_info=True)
         return ProcessedImageResponse(
@@ -901,97 +989,115 @@ async def apply_image_enhancements_endpoint(
             message="Failed to apply enhancements due to processing error.",
             error=str(e)
         )
-    except Exception as e:
-        logger.error(f"Apply Enhancement: Unexpected error during image processing for image_id {request.image_id}: {e}", exc_info=True)
+    except Exception as e_process: # Catch other processing errors
+        logger.error(f"Apply Enhancement: Unexpected error during image processing of {temp_original_image_path} for image_id {request.image_id}: {e_process}", exc_info=True)
         return ProcessedImageResponse(
             original_image_id=request.image_id,
-            message="Failed to apply enhancements due to an unexpected server error.",
-            error=str(e)
+            message="Failed to apply enhancements due to an unexpected server error during processing.",
+            error=str(e_process)
         )
+    finally: # Cleanup temp original image
+        if temp_original_image_path and os.path.exists(temp_original_image_path):
+            try:
+                os.remove(temp_original_image_path)
+                logger.info(f"Apply Enhancement: Cleaned up temporary original image: {temp_original_image_path}")
+            except Exception as e_clean:
+                logger.error(f"Apply Enhancement: Failed to clean up temporary original image {temp_original_image_path}: {e_clean}")
 
     if processed_pil_image is None:
-        # This case should ideally be caught by specific exceptions above, but as a safeguard:
-        logger.error(f"Apply Enhancement: Processing returned None for image_id: {request.image_id}")
+        logger.error(f"Apply Enhancement: Processing returned None for image_id: {request.image_id} (original path {db_image.filepath})")
         return ProcessedImageResponse(
             original_image_id=request.image_id,
             message="Failed to apply enhancements.",
             error="Image processing returned no result."
         )
 
+    # Upload processed image to S3 (this part was already correct from previous steps)
     try:
-        os.makedirs(PROCESSED_UPLOAD_DIR, exist_ok=True)
-        # Save as PNG to preserve quality and handle alpha channels from blur/segmentation
-        new_filename = f"{db_image.id}_enhanced_{uuid.uuid4().hex}.png"
-        processed_image_filepath = os.path.join(PROCESSED_UPLOAD_DIR, new_filename)
+        # This 'if not storage_service' check is technically redundant if the one above is hit,
+        # but kept for safety within this specific try block for uploading.
+        if not storage_service:
+            logger.error("StorageService somehow became unavailable before S3 upload of processed image.")
+            # This should ideally not be reached if the check after fetching db_image is in place.
+            return ProcessedImageResponse(original_image_id=request.image_id, message="Failed to apply enhancements.", error="Storage service unavailable for upload.")
 
-        logger.info(f"Apply Enhancement: Saving processed image for id {request.image_id} to {processed_image_filepath}")
-        processed_pil_image.save(processed_image_filepath, format='PNG')
+        # Convert PIL image to bytes in memory
+        image_bytes_io = BytesIO()
+        processed_pil_image.save(image_bytes_io, format='PNG')
+        image_bytes_io.seek(0) # Reset stream position to the beginning
 
-        # Initialize variables for processed image record and ID
-        db_processed_image_record = None
+        # Generate S3 object key
+        s3_processed_object_key = f"processed_images/{db_image.id}_enhanced_{uuid.uuid4().hex}.png"
+
+        logger.info(f"Apply Enhancement: Uploading processed image for id {request.image_id} to S3 key: {s3_processed_object_key}")
+        storage_service.upload_file(
+            file_obj=image_bytes_io,
+            object_key=s3_processed_object_key,
+            content_type='image/png',
+            acl="private"
+        )
+
         processed_image_id_for_response = None
+        db_processed_image_record = None # Initialize for wider scope
 
         try:
-            # 3. Create an Image record for the processed image
-            processed_image_filesize = os.path.getsize(processed_image_filepath)
+            # Create an Image record for the processed image in S3
+            processed_image_filesize = image_bytes_io.getbuffer().nbytes # Get size from BytesIO
             processed_image_width, processed_image_height = processed_pil_image.size
-            processed_image_format = processed_pil_image.format if processed_pil_image.format else 'PNG'
-
 
             image_create_data = ImageCreate(
-                filename=new_filename,
-                filepath=processed_image_filepath,
+                filename=os.path.basename(s3_processed_object_key), # Use S3 key's basename as filename
+                filepath=s3_processed_object_key, # S3 object key
                 filesize=processed_image_filesize,
-                mimetype='image/png', # Explicitly PNG as we save in this format
+                mimetype='image/png',
                 width=processed_image_width,
                 height=processed_image_height,
-                format=processed_image_format
-                # exif_orientation and color_profile can be None or copied if available/relevant
+                format='PNG'
             )
             db_processed_image_record = crud.create_image(
-                db=db,
-                image=image_create_data,
-                width=image_create_data.width,
-                height=image_create_data.height,
-                format=image_create_data.format
+                db=db, image=image_create_data, width=image_create_data.width, height=image_create_data.height, format=image_create_data.format
             )
             processed_image_id_for_response = db_processed_image_record.id
-            logger.info(f"Apply Enhancement: Created DB record for processed image with ID: {db_processed_image_record.id}")
+            logger.info(f"Apply Enhancement: Created DB record for S3 processed image with ID: {db_processed_image_record.id}")
 
-            # 5. Create EnhancementHistory record
+            # Create EnhancementHistory record
             parameters_json_str = json.dumps(request.parameters.model_dump())
             history_create_data = EnhancementHistoryBase(
-                original_image_id=db_image.id, # original image ID
-                processed_image_id=db_processed_image_record.id, # new processed image ID
+                original_image_id=db_image.id,
+                processed_image_id=db_processed_image_record.id,
                 parameters_json=parameters_json_str
             )
             crud.create_enhancement_history(db=db, history_data=history_create_data, user_id=current_user.id)
-            logger.info(f"Apply Enhancement: Enhancement history record created for user {current_user.id}, original image {db_image.id}, processed image {db_processed_image_record.id}")
+            logger.info(f"Apply Enhancement: Enhancement history record created for user {current_user.id}, original image {db_image.id}, processed S3 image {db_processed_image_record.id}")
 
         except Exception as db_error:
-            # Log DB errors but don't fail the entire request if file was saved
-            logger.error(f"Apply Enhancement: Error during DB operations (saving processed image record or history) for original image id {request.image_id}: {db_error}", exc_info=True)
-            # The processed_image_id_for_response might be None if create_image failed, or set if history creation failed.
-            # This is acceptable as per error handling guidelines (prioritize returning image path).
+            logger.error(f"Apply Enhancement: Error during DB operations for S3 processed image (original image id {request.image_id}): {db_error}", exc_info=True)
+            # If DB ops fail, S3 object still exists. We might need a cleanup mechanism for orphaned S3 objects.
+            # For now, return the S3 key or a presigned URL if possible, but flag that DB ops failed.
+            # The processed_image_id_for_response will be None if create_image failed.
+
+        # Generate presigned URL for the processed image
+        presigned_url = None
+        try:
+            presigned_url = storage_service.generate_presigned_url(s3_processed_object_key)
+        except Exception as url_gen_error:
+            logger.error(f"Apply Enhancement: Failed to generate presigned URL for {s3_processed_object_key}: {url_gen_error}", exc_info=True)
+            # Return S3 key as path if presigned URL fails, or handle as critical error
 
         return ProcessedImageResponse(
             original_image_id=request.image_id,
-            processed_image_id=processed_image_id_for_response, # This will be None if DB op failed before setting it
-            processed_image_path=processed_image_filepath,
-            message="Image enhancements applied and saved successfully."
+            processed_image_id=processed_image_id_for_response,
+            processed_image_path=presigned_url or s3_processed_object_key, # Fallback to S3 key if URL gen fails
+            message="Image enhancements applied and uploaded to S3 successfully." + (" DB record updated." if processed_image_id_for_response else " DB record update failed.")
         )
-    except IOError as e:
-        logger.error(f"Apply Enhancement: Failed to save processed image for id {request.image_id} to path {processed_image_filepath}: {e}", exc_info=True)
+    except HTTPException as e: # Re-raise HTTPExceptions from storage_service.upload_file
+        logger.error(f"Apply Enhancement: HTTPException during S3 upload for {request.image_id}: {e.detail}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request.image_id, message="Failed to apply enhancements.", error=f"S3 upload error: {e.detail}")
+    except Exception as e:
+        logger.error(f"Apply Enhancement: Unexpected error during S3 upload or processing for {request.image_id}: {e}", exc_info=True)
         return ProcessedImageResponse(
             original_image_id=request.image_id,
-            message="Failed to save processed image after applying enhancements.",
-            error=str(e)
-        )
-    except Exception as e: # Catch any other unexpected errors during save
-        logger.error(f"Apply Enhancement: Unexpected error saving processed image for {request.image_id}: {e}", exc_info=True)
-        return ProcessedImageResponse(
-            original_image_id=request.image_id,
-            message="An unexpected error occurred while saving the processed image.",
+            message="An unexpected error occurred while processing and uploading the enhanced image.",
             error=str(e)
         )
 
@@ -1028,86 +1134,136 @@ async def apply_preset_to_image_endpoint(
     db_image = crud.get_image(db, image_id=request_data.image_id)
     if not db_image:
         return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Image with id {request_data.image_id} not found.")
-    if not db_image.filepath:
-        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Filepath for image id {request_data.image_id} not available.")
-    if not os.path.exists(db_image.filepath):
-        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Image file not found at path {db_image.filepath}.")
+    if not db_image.filepath: # S3 Key
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"S3 key for image id {request_data.image_id} not available.")
 
-    # 4. Face Detection (if needed)
-    face_results = []
-    if enhancement_params.face_smooth_intensity > 0:
-        try:
-            face_results = detect_faces(db_image.filepath)
-        except Exception as e:
-            logger.error(f"Apply Preset: Error during face detection for image {request_data.image_id}: {e}", exc_info=True)
-            # Proceed without face_results, or return error if critical
-            face_results = []
+    if not storage_service: # Ensure storage_service is available
+        logger.error("StorageService not available for applying preset.")
+        return ProcessedImageResponse(
+            original_image_id=request_data.image_id,
+            message="Failed to apply preset.",
+            error="Image storage service is not configured."
+        )
 
-    # 5. Apply Enhancements
+    temp_original_image_path_preset = None
     processed_pil_image: Optional[PILImage.Image] = None
     try:
+        # Download original image from S3 to a temporary path
+        os.makedirs(TEMP_PROCESSING_DIR, exist_ok=True)
+        base_s3_key_preset_original = os.path.basename(db_image.filepath)
+        temp_original_image_path_preset = os.path.join(TEMP_PROCESSING_DIR, f"preset_original_{uuid.uuid4().hex}_{base_s3_key_preset_original}")
+
+        logger.info(f"Apply Preset: Downloading original image {db_image.filepath} to {temp_original_image_path_preset} for image_id: {request_data.image_id}")
+        storage_service.download_file(object_key=db_image.filepath, destination_path=temp_original_image_path_preset)
+
+        face_results = []
+        if enhancement_params.face_smooth_intensity > 0:
+            try:
+                logger.info(f"Apply Preset: Performing face detection on {temp_original_image_path_preset} for image_id: {request_data.image_id}")
+                face_results = detect_faces(temp_original_image_path_preset)
+            except Exception as e_face_preset:
+                logger.error(f"Apply Preset: Error during face detection for {temp_original_image_path_preset} (image_id {request_data.image_id}): {e_face_preset}", exc_info=True)
+                face_results = []
+
+        logger.info(f"Apply Preset: Calling apply_enhancements for image_id: {request_data.image_id} using {temp_original_image_path_preset}")
         processed_pil_image = apply_enhancements(
-            image_path=db_image.filepath,
+            image_path=temp_original_image_path_preset, # Use temp path
             params=enhancement_params.model_dump(),
             face_detection_results=face_results
         )
-    except ImageProcessingError as e:
-        logger.error(f"Apply Preset: ImageProcessingError for image {request_data.image_id} with preset {preset_id}: {e}", exc_info=True)
-        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset due to processing error.", error=str(e))
-    except Exception as e:
-        logger.error(f"Apply Preset: Unexpected error during image processing for image {request_data.image_id} with preset {preset_id}: {e}", exc_info=True)
-        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset due to an unexpected server error.", error=str(e))
+    except HTTPException as e_s3_download_preset:
+        logger.error(f"Apply Preset: S3 download failed for {db_image.filepath} (image_id {request_data.image_id}): {e_s3_download_preset.detail}")
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Could not retrieve original image: {e_s3_download_preset.detail}")
+    except ImageProcessingError as e_process_preset:
+        logger.error(f"Apply Preset: ImageProcessingError for {temp_original_image_path_preset} (image_id {request_data.image_id}): {e_process_preset}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset due to processing error.", error=str(e_process_preset))
+    except Exception as e_other_preset:
+        logger.error(f"Apply Preset: Unexpected error during processing of {temp_original_image_path_preset} for image_id {request_data.image_id}: {e_other_preset}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset due to an unexpected server error.", error=str(e_other_preset))
+    finally:
+        if temp_original_image_path_preset and os.path.exists(temp_original_image_path_preset):
+            try:
+                os.remove(temp_original_image_path_preset)
+                logger.info(f"Apply Preset: Cleaned up temporary original image: {temp_original_image_path_preset}")
+            except Exception as e_clean_preset:
+                logger.error(f"Apply Preset: Failed to clean up temporary original image {temp_original_image_path_preset}: {e_clean_preset}")
 
     if processed_pil_image is None:
+        logger.error(f"Apply Preset: Processing returned None for image_id: {request_data.image_id} (original S3 key {db_image.filepath})")
         return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error="Image processing returned no result.")
 
-    # 6. Save Processed Image and Record History
+    # 6. Save Processed Image to S3 and Record History (this part was mostly correct)
     try:
-        os.makedirs(PROCESSED_UPLOAD_DIR, exist_ok=True)
-        new_filename = f"{db_image.id}_preset_enhanced_{uuid.uuid4().hex}.png"
-        processed_image_filepath = os.path.join(PROCESSED_UPLOAD_DIR, new_filename)
-        processed_pil_image.save(processed_image_filepath, format='PNG')
+        # Redundant check, but safe
+        if not storage_service:
+            logger.error("StorageService became unavailable before S3 upload of preset-enhanced image.")
+            return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error="Storage service unavailable for upload.")
 
-        db_processed_image_record = None
+        # Convert PIL image to bytes in memory
+        image_bytes_io = BytesIO()
+        processed_pil_image.save(image_bytes_io, format='PNG')
+        image_bytes_io.seek(0)
+
+        # Generate S3 object key
+        s3_processed_object_key = f"processed_images/{db_image.id}_preset_enhanced_{uuid.uuid4().hex}.png"
+
+        logger.info(f"Apply Preset: Uploading processed image for id {request_data.image_id} (preset {preset_id}) to S3 key: {s3_processed_object_key}")
+        storage_service.upload_file(
+            file_obj=image_bytes_io,
+            object_key=s3_processed_object_key,
+            content_type='image/png',
+            acl="private"
+        )
+
         processed_image_id_for_response = None
+        db_processed_image_record = None
+
         try:
-            processed_image_filesize = os.path.getsize(processed_image_filepath)
+            processed_image_filesize = image_bytes_io.getbuffer().nbytes
             processed_image_width, processed_image_height = processed_pil_image.size
             img_create_data = ImageCreate(
-                filename=new_filename, filepath=processed_image_filepath, filesize=processed_image_filesize,
-                mimetype='image/png', width=processed_image_width, height=processed_image_height,
-                format=processed_pil_image.format if processed_pil_image.format else 'PNG'
+                filename=os.path.basename(s3_processed_object_key),
+                filepath=s3_processed_object_key, # S3 object key
+                filesize=processed_image_filesize,
+                mimetype='image/png',
+                width=processed_image_width,
+                height=processed_image_height,
+                format='PNG'
             )
             db_processed_image_record = crud.create_image(db=db, image=img_create_data, width=img_create_data.width, height=img_create_data.height, format=img_create_data.format)
             processed_image_id_for_response = db_processed_image_record.id
-            logger.info(f"Apply Preset: Created DB record for processed image {db_processed_image_record.id}")
+            logger.info(f"Apply Preset: Created DB record for S3 processed image {db_processed_image_record.id}")
 
-            # Create EnhancementHistory record, noting the preset used
             history_params_dict = enhancement_params.model_dump()
-            history_params_dict["applied_preset_id"] = str(preset_id) # Add preset ID to history
+            history_params_dict["applied_preset_id"] = str(preset_id)
             parameters_json_for_history = json.dumps(history_params_dict)
-
             history_create_data = EnhancementHistoryBase(
                 original_image_id=db_image.id,
                 processed_image_id=db_processed_image_record.id,
                 parameters_json=parameters_json_for_history
             )
             crud.create_enhancement_history(db=db, history_data=history_create_data, user_id=current_user.id)
-            logger.info(f"Apply Preset: Enhancement history created for user {current_user.id}, original image {db_image.id}, processed {db_processed_image_record.id}, preset {preset_id}")
+            logger.info(f"Apply Preset: Enhancement history created for user {current_user.id}, original image {db_image.id}, processed S3 {db_processed_image_record.id}, preset {preset_id}")
 
         except Exception as db_error:
             logger.error(f"Apply Preset: DB error for original image {request_data.image_id}, preset {preset_id}: {db_error}", exc_info=True)
-            # Return image path even if DB history fails
+            # S3 object still exists. Consider cleanup or logging for orphaned objects.
+
+        presigned_url = None
+        try:
+            presigned_url = storage_service.generate_presigned_url(s3_processed_object_key)
+        except Exception as url_gen_error:
+            logger.error(f"Apply Preset: Failed to generate presigned URL for {s3_processed_object_key}: {url_gen_error}", exc_info=True)
 
         return ProcessedImageResponse(
             original_image_id=request_data.image_id,
             processed_image_id=processed_image_id_for_response,
-            processed_image_path=processed_image_filepath,
-            message="Preset applied and image saved successfully."
+            processed_image_path=presigned_url or s3_processed_object_key, # Fallback to key
+            message="Preset applied and image uploaded to S3 successfully." + (" DB record updated." if processed_image_id_for_response else " DB record update failed.")
         )
-    except IOError as e:
-        logger.error(f"Apply Preset: Failed to save processed image for {request_data.image_id}, preset {preset_id}: {e}", exc_info=True)
-        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to save processed image after applying preset.", error=str(e))
+    except HTTPException as e: # Re-raise from storage_service
+        logger.error(f"Apply Preset: HTTPException during S3 upload for {request_data.image_id}, preset {preset_id}: {e.detail}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"S3 upload error: {e.detail}")
     except Exception as e:
-        logger.error(f"Apply Preset: Unexpected error saving image for {request_data.image_id}, preset {preset_id}: {e}", exc_info=True)
-        return ProcessedImageResponse(original_image_id=request_data.image_id, message="An unexpected error occurred while saving the processed image using preset.", error=str(e))
+        logger.error(f"Apply Preset: Unexpected error during S3 upload or processing for {request_data.image_id}, preset {preset_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="An unexpected error occurred while applying preset and uploading.", error=str(e))

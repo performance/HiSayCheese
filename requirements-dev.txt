@@ -1,2 +1,4 @@
 pytest
 httpx
+boto3>=1.20.0 # Or a version compatible with your moto version
+moto>=3.0.0 # Or a recent stable version

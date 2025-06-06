@@ -94,7 +94,13 @@ HiSayCheese offers an innovative solution: users can simply upload a selfie, and
     *   OpenCV (for image manipulation, transformations).
     *   Deepface, facenet (for face analysis, potentially quality assessment).
     *   TensorFlow.js / face-api.js (for client-side AI tasks if feasible and performant).
-*   **Backend:** Firebase (as considered in the original project setup, for auth, database, storage), Node.js (for server-side logic and AI model interaction).
+*   **Backend:**
+    *   FastAPI (Python) for the main API.
+    *   SQLAlchemy with PostgreSQL or SQLite for database.
+    *   Firebase (for auth, potentially user metadata/preferences).
+    *   Node.js (potentially for specific microservices or AI model interaction if not directly in Python).
+*   **Cloud Storage:**
+    *   AWS S3 (for storing uploaded and processed image files).
 *   **Considerations:** Strategic decisions on client-side vs. backend processing for different AI effects to balance performance, cost, and user experience.
 
 ## Current State of Implementation
@@ -121,6 +127,29 @@ Steps:
 Example: `export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-file.json"`
 
 Ensure the backend application has this environment variable set when it starts.
+
+### AWS S3 for Cloud Storage
+
+The application utilizes AWS S3 for storing all uploaded original images and any images processed or enhanced through the platform. This cloud-based storage ensures scalability and reliability.
+
+**Required Environment Variables:**
+
+To connect to your AWS S3 bucket, the following environment variables must be set in the backend application's environment:
+
+*   `AWS_S3_BUCKET_NAME`: The name of your S3 bucket (e.g., `my-hisaycheese-images`).
+*   `AWS_S3_REGION`: The AWS region where your S3 bucket is located (e.g., `us-east-1`).
+*   `AWS_ACCESS_KEY_ID`: Your AWS access key ID.
+*   `AWS_SECRET_ACCESS_KEY`: Your AWS secret access key.
+
+These settings are loaded by `config.py`. Ensure these variables are configured correctly for the application to interact with S3. You can set these directly in your shell, or use a `.env` file management system appropriate for your deployment.
+
+**API Responses and Pre-signed URLs:**
+
+When images are uploaded or processed, API endpoints that return image locations (e.g., `presigned_url` in the upload response, `processed_image_path` in enhancement responses) will provide AWS S3 pre-signed URLs. These URLs grant temporary, secure access to the image files stored in the private S3 bucket.
+
+**Local Development with S3 Mocking:**
+
+For local development and testing, S3 interactions are typically mocked (e.g., using `moto` as implemented in the project's tests). When running the application locally with such mocks, you might still need to set the S3-related environment variables (e.g., `AWS_S3_BUCKET_NAME`, `AWS_S3_REGION`, and dummy credentials like `AWS_ACCESS_KEY_ID="testing"`, `AWS_SECRET_ACCESS_KEY="testing"`) for the `StorageService` to initialize correctly, even though `moto` will intercept the actual S3 calls. Refer to `config.py` for how these are loaded and for any default fallback values (though for credentials, real or mock values via environment variables are expected for S3 functionality).
 
 ## Project Naming
 

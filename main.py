@@ -26,6 +26,7 @@ from typing import List # Added for FaceDetection models
 from services.face_detection import detect_faces # Added for face detection endpoint
 from services.image_quality import analyze_image_quality # New import
 from services.auto_enhancement import calculate_auto_enhancements # New import for auto enhancement
+from services.image_processing import apply_enhancements, ImageProcessingError # New import for applying enhancements
 
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
@@ -66,6 +67,27 @@ class AutoEnhancementResponse(BaseModel):
     enhancement_parameters: EnhancementParameters
     message: Optional[str] = None
 
+# Pydantic models for Manual Image Enhancement Request
+class EnhancementRequestParams(BaseModel): # Mirrors EnhancementParameters
+    brightness_target: float
+    contrast_target: float
+    saturation_target: float
+    background_blur_radius: int
+    crop_rect: List[int]  # [x, y, width, height]
+    face_smooth_intensity: float
+
+class ImageEnhancementRequest(BaseModel):
+    image_id: uuid.UUID
+    parameters: EnhancementRequestParams
+
+# Pydantic model for Processed Image Response
+class ProcessedImageResponse(BaseModel):
+    original_image_id: uuid.UUID
+    processed_image_id: Optional[uuid.UUID] = None
+    processed_image_path: Optional[str] = None
+    message: str
+    error: Optional[str] = None
+
 app = FastAPI()
 
 # Configure basic logging
@@ -74,6 +96,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 UPLOAD_DIR = "uploads/images/"
+PROCESSED_UPLOAD_DIR = "uploads/processed/" # Directory for processed images
 ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
 MIME_TYPE_TO_EXTENSION = {
     "image/jpeg": ".jpg",
@@ -533,3 +556,120 @@ async def get_auto_enhancement_parameters(
     except Exception as e:
         logger.error(f"Error calculating auto enhancement parameters for image_id {image_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate auto enhancement parameters due to an internal error.")
+
+@app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
+async def apply_image_enhancements_endpoint(
+    request: ImageEnhancementRequest,
+    db: Session = Depends(get_db)
+):
+    logger.info(f"Received request to apply enhancements for image_id: {request.image_id}")
+
+    db_image = crud.get_image(db, image_id=request.image_id)
+    if not db_image:
+        logger.warning(f"Apply Enhancement: Image not found in DB for id: {request.image_id}")
+        # Return 200 OK with error message in body as per ProcessedImageResponse model for client handling
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to apply enhancements.",
+            error=f"Image with id {request.image_id} not found."
+        )
+
+    if not db_image.filepath:
+        logger.warning(f"Apply Enhancement: Filepath not available for image_id: {request.image_id}")
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to apply enhancements.",
+            error=f"Filepath for image id {request.image_id} not available."
+        )
+
+    if not os.path.exists(db_image.filepath):
+        logger.error(f"Apply Enhancement: Image file not found at path: {db_image.filepath} for image_id: {request.image_id}")
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to apply enhancements.",
+            error=f"Image file not found at path {db_image.filepath}."
+        )
+
+    face_results = []
+    # Perform face detection if face smoothing or other face-dependent features are requested
+    # For simplicity, we run it if smoothing intensity is positive.
+    # Could also run if auto-crop based on faces is a parameter (not currently the case for manual apply).
+    if request.parameters.face_smooth_intensity > 0: # or other face-dependent params
+        try:
+            logger.info(f"Apply Enhancement: Performing face detection for image_id: {request.image_id} for smoothing.")
+            face_results = detect_faces(db_image.filepath)
+        except FileNotFoundError:
+             logger.error(f"Apply Enhancement: File not found for face detection: {db_image.filepath}")
+             return ProcessedImageResponse(
+                original_image_id=request.image_id,
+                message="Failed to apply enhancements.",
+                error="Original image file not found during face detection."
+            )
+        except Exception as e:
+            logger.error(f"Apply Enhancement: Error during face detection for image_id {request.image_id}: {e}", exc_info=True)
+            # Decide if this is fatal. For now, proceed with no faces.
+            face_results = []
+
+
+    processed_pil_image: Optional[PILImage.Image] = None
+    try:
+        logger.info(f"Apply Enhancement: Calling apply_enhancements service for image_id: {request.image_id}")
+        processed_pil_image = apply_enhancements(
+            image_path=db_image.filepath,
+            params=request.parameters.model_dump(), # Convert Pydantic model to dict
+            face_detection_results=face_results
+        )
+    except ImageProcessingError as e:
+        logger.error(f"Apply Enhancement: ImageProcessingError for image_id {request.image_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to apply enhancements due to processing error.",
+            error=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Apply Enhancement: Unexpected error during image processing for image_id {request.image_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to apply enhancements due to an unexpected server error.",
+            error=str(e)
+        )
+
+    if processed_pil_image is None:
+        # This case should ideally be caught by specific exceptions above, but as a safeguard:
+        logger.error(f"Apply Enhancement: Processing returned None for image_id: {request.image_id}")
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to apply enhancements.",
+            error="Image processing returned no result."
+        )
+
+    try:
+        os.makedirs(PROCESSED_UPLOAD_DIR, exist_ok=True)
+        # Save as PNG to preserve quality and handle alpha channels from blur/segmentation
+        new_filename = f"{db_image.id}_enhanced_{uuid.uuid4().hex}.png"
+        processed_image_filepath = os.path.join(PROCESSED_UPLOAD_DIR, new_filename)
+
+        logger.info(f"Apply Enhancement: Saving processed image for id {request.image_id} to {processed_image_filepath}")
+        processed_pil_image.save(processed_image_filepath, format='PNG')
+
+        # For now, processed_image_id is None as we are not creating a new DB record.
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            processed_image_id=None,
+            processed_image_path=processed_image_filepath,
+            message="Image enhancements applied and saved successfully."
+        )
+    except IOError as e:
+        logger.error(f"Apply Enhancement: Failed to save processed image for id {request.image_id} to path {processed_image_filepath}: {e}", exc_info=True)
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="Failed to save processed image after applying enhancements.",
+            error=str(e)
+        )
+    except Exception as e: # Catch any other unexpected errors during save
+        logger.error(f"Apply Enhancement: Unexpected error saving processed image for {request.image_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(
+            original_image_id=request.image_id,
+            message="An unexpected error occurred while saving the processed image.",
+            error=str(e)
+        )

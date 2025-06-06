@@ -7,3 +7,4 @@ google-cloud-vision>=3.0.0
 Pillow>=9.0.0
 opencv-python
 numpy
+mediapipe

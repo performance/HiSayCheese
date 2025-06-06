@@ -21,11 +21,24 @@ from models import models # This imports the models module
 # We need ImageCreate and ImageSchema for type hinting and response_model
 # from models.models import ImageCreate, ImageSchema # More specific imports
 import logging # Added logging
+from typing import List # Added for FaceDetection models
+
+from services.face_detection import detect_faces # Added for face detection endpoint
 
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
     is_approved: bool
     rejection_reason: Optional[str] = None
+
+# Pydantic models for Face Detection API
+class FaceBoundingBox(BaseModel):
+    box: List[int]  # [x, y, width, height]
+    confidence: Optional[float] = None
+
+class FaceDetectionResponse(BaseModel):
+    faces: List[FaceBoundingBox]
+    image_id: uuid.UUID # Changed from int
+    message: Optional[str] = None
 
 app = FastAPI()
 
@@ -327,3 +340,43 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
             color_profile=image_data_to_create.color_profile
         )
         return db_image
+
+# Endpoint for Face Detection
+@app.get("/api/analysis/faces/{image_id}", response_model=FaceDetectionResponse)
+async def get_face_detections(image_id: uuid.UUID, db: Session = Depends(get_db)): # Changed image_id type to uuid.UUID
+    db_image = crud.get_image(db, image_id=image_id) # crud.get_image should handle UUID
+    if not db_image:
+        logger.warning(f"Face detection request for non-existent image_id: {image_id}")
+        raise HTTPException(status_code=404, detail=f"Image with id {image_id} not found.")
+
+    if not db_image.filepath:
+        # This case might occur if an image was recorded in DB but file saving failed
+        # or if it's a rejected image that wasn't saved (e.g. content moderation failed)
+        logger.info(f"Filepath for image id {image_id} not available. Image status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
+        raise HTTPException(status_code=404, detail=f"Filepath for image id {image_id} not available. The image might not have been processed or saved correctly.")
+
+    try:
+        logger.info(f"Attempting face detection for image id {image_id} at path: {db_image.filepath}")
+        detected_faces_data = detect_faces(db_image.filepath)
+
+        response_faces = []
+        for face_data in detected_faces_data:
+            response_faces.append(FaceBoundingBox(box=face_data['box'], confidence=face_data.get('confidence')))
+
+        if not response_faces:
+            logger.info(f"No faces detected for image id {image_id} using local detection.")
+            return FaceDetectionResponse(faces=[], image_id=db_image.id, message="No faces detected.") # Use db_image.id (UUID)
+
+        logger.info(f"Successfully detected {len(response_faces)} faces for image id {image_id} using local detection.")
+        return FaceDetectionResponse(faces=response_faces, image_id=db_image.id) # Use db_image.id (UUID)
+
+    except FileNotFoundError:
+        logger.error(f"File not found for image id {image_id} at path: {db_image.filepath} during face detection attempt.")
+        raise HTTPException(status_code=404, detail=f"Image file not found for id {image_id}. It may have been moved or deleted after upload.")
+    except ValueError as e:
+        # This can be caught if detect_faces raises it due to image loading issues (e.g. invalid image file)
+        logger.error(f"Error processing image id {image_id} with local face detection (ValueError): {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing image id {image_id}: Invalid image file or format. Details: {str(e)}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while detecting faces for image id {image_id} using local detection: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during face detection.")

@@ -455,6 +455,49 @@ def mock_moderate_content_approve_fixture(mocker):
         return_value=ContentModerationResult(is_approved=True, rejection_reason=None)
     )
 
+
+# --- CORS Tests ---
+TEST_ORIGIN = "http://example.com"
+
+def test_cors_basic_get_request_with_origin(client: TestClient):
+    response = client.get("/", headers={"Origin": TEST_ORIGIN})
+    assert response.status_code == 200
+    # When allow_origins is ["*"], FastAPI/Starlette typically returns "*"
+    assert response.headers.get("Access-Control-Allow-Origin") == "*"
+    assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+
+def test_cors_preflight_options_request(client: TestClient):
+    request_headers = {
+        "Origin": TEST_ORIGIN,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "Content-Type, Authorization",
+    }
+    response = client.options("/", headers=request_headers)
+    assert response.status_code == 200
+
+    # For ["*"], server might return "*" or echo the specific origin.
+    # FastAPI's default behavior for ["*"] is to return the specific origin for preflight.
+    assert response.headers.get("Access-Control-Allow-Origin") == TEST_ORIGIN
+
+    # Check if allowed methods from request are present or if it's "*"
+    allowed_methods = response.headers.get("Access-Control-Allow-Methods")
+    assert allowed_methods is not None
+    if "*" not in allowed_methods:
+        assert "POST" in allowed_methods.upper()
+
+    # Check if allowed headers from request are present or if it's "*"
+    allowed_headers = response.headers.get("Access-Control-Allow-Headers")
+    assert allowed_headers is not None
+    if "*" not in allowed_headers:
+        requested_headers = set(h.strip().lower() for h in "Content-Type, Authorization".lower().split(','))
+        returned_allowed_headers = set(h.strip().lower() for h in allowed_headers.split(','))
+        assert requested_headers.issubset(returned_allowed_headers)
+
+    assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+    # Optional: Check for Access-Control-Max-Age if you expect it
+    # assert "Access-Control-Max-Age" in response.headers
+
+
 # --- Helper for Advanced Rate Limit Tests ---
 import time # For rate limit reset tests
 
@@ -511,6 +554,12 @@ def create_user_and_get_token(client_instance, db_session_instance, email_prefix
     # For now, caller should handle cleanup or use appropriate DB fixtures.
     return token, user_email
 
+# Copied from test_auth.py for now, ideally should be in a shared conftest.py or utils
+def clear_user_from_db(db: Session, email: str):
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user:
+        db.delete(user)
+        db.commit()
 
 # --- Security Headers Test ---
 def test_security_headers_present():

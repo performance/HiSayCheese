@@ -219,6 +219,145 @@ import time
 
 # Assuming these constants are accessible from main or defined for tests
 try:
+    from main import ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT # Import constants
+    # User endpoints should always use AUTH_USER_RATE_LIMIT as they require authentication
+    AUTH_REQUESTS_PER_WINDOW = int(AUTH_USER_RATE_LIMIT.split('/')[0])
+except ImportError:
+    AUTH_REQUESTS_PER_WINDOW = 100 # Fallback, ensure matches main.py
+
+def get_rate_limit_headers_from_response_users(response): # Renamed for clarity
+    return {
+        "limit": response.headers.get("X-RateLimit-Limit"),
+        "remaining": response.headers.get("X-RateLimit-Remaining"),
+        "reset": response.headers.get("X-RateLimit-Reset"),
+    }
+
+# 1. Differentiated Limits (Authenticated for /api/users/history)
+# All /api/users/ endpoints require authentication, so they should always use AUTH_USER_RATE_LIMIT.
+def test_history_rate_limiting_authenticated(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory("hist_rl_auth")
+    token = access_token_factory(user_details)
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        response = client.get("/api/users/history", headers=auth_headers)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Authenticated request {i+1} to /history rate limited prematurely.")
+        assert response.status_code == status.HTTP_200_OK # Assuming history records can be empty list
+
+    # Next request should be rate limited
+    response = client.get("/api/users/history", headers=auth_headers)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    headers = get_rate_limit_headers_from_response_users(response)
+    assert headers["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == "0"
+    # Cleanup handled by test_user_factory
+
+# 2. Rate Limiting Keyed by User ID (Isolation) - using /api/users/history
+def test_rate_limiting_user_isolation_on_user_endpoint(client: TestClient, test_user_factory, access_token_factory):
+    # User A
+    user_a_details = test_user_factory("userA_iso_hist")
+    token_a = access_token_factory(user_a_details)
+
+    # User B
+    user_b_details = test_user_factory("userB_iso_hist")
+    token_b = access_token_factory(user_b_details)
+
+    # User A makes some requests (e.g., half the limit)
+    for i in range(AUTH_REQUESTS_PER_WINDOW // 2):
+        res_a_half = client.get("/api/users/history", headers={"Authorization": f"Bearer {token_a}"})
+        assert res_a_half.status_code == status.HTTP_200_OK
+
+
+    # User B makes requests, should have full quota
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        response_b = client.get("/api/users/history", headers={"Authorization": f"Bearer {token_b}"})
+        if response_b.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"User B request {i+1} to /history rate limited prematurely by User A's activity.")
+        assert response_b.status_code == status.HTTP_200_OK
+        if i == 0: # Check headers on first request for User B
+            headers_b_first = get_rate_limit_headers_from_response_users(response_b)
+            assert headers_b_first["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+            assert headers_b_first["remaining"] == str(AUTH_REQUESTS_PER_WINDOW - 1)
+
+    # User B exceeds their limit
+    response_b_limit_exceeded = client.get("/api/users/history", headers={"Authorization": f"Bearer {token_b}"})
+    assert response_b_limit_exceeded.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+    # User A should still have remaining quota from their initial half
+    response_a_after_b = client.get("/api/users/history", headers={"Authorization": f"Bearer {token_a}"})
+    assert response_a_after_b.status_code == status.HTTP_200_OK # Should not be 429
+    headers_a_after_b = get_rate_limit_headers_from_response_users(response_a_after_b)
+    # Remaining should be total_limit - requests_made_by_A - this_current_request
+    expected_remaining_a = AUTH_REQUESTS_PER_WINDOW - (AUTH_REQUESTS_PER_WINDOW // 2) - 1
+    assert headers_a_after_b["remaining"] == str(expected_remaining_a)
+
+    # Cleanup handled by test_user_factory fixture
+
+# 3. Rate Limit Headers for /api/users/presets (POST)
+def test_create_preset_rate_limit_headers(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory("preset_hdr_rl")
+    token = access_token_factory(user_details)
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    preset_data = {"preset_name": "Test Preset RL Headers", "parameters_json": "{}"}
+    response = client.post("/api/users/presets", json=preset_data, headers=auth_headers)
+
+    assert response.status_code == status.HTTP_201_CREATED
+    headers = get_rate_limit_headers_from_response_users(response)
+    assert headers["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == str(AUTH_REQUESTS_PER_WINDOW - 1)
+    assert headers["reset"] is not None
+    # Cleanup handled by test_user_factory
+
+# 4. Rate Limit Reset Test (using /api/users/history)
+def test_history_rate_limit_reset_authenticated(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory("hist_reset_rl")
+    token = access_token_factory(user_details)
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    # Exceed limit
+    for i in range(AUTH_REQUESTS_PER_WINDOW + 1):
+        response = client.get("/api/users/history", headers=auth_headers)
+        if i == AUTH_REQUESTS_PER_WINDOW:
+            assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            headers_429 = get_rate_limit_headers_from_response_users(response)
+            reset_time = int(headers_429["reset"])
+            current_time = int(time.time())
+            sleep_duration = max(0, reset_time - current_time) + 1
+            if sleep_duration > 65: # Safety for tests, default window is 1 minute
+                pytest.skip(f"Reset time too far ({sleep_duration}s), skipping sleep.")
+            time.sleep(sleep_duration)
+
+    # Try again after waiting
+    response_after_reset = client.get("/api/users/history", headers=auth_headers)
+    assert response_after_reset.status_code == status.HTTP_200_OK
+    headers_after = get_rate_limit_headers_from_response_users(response_after_reset)
+    assert headers_after["remaining"] == str(AUTH_REQUESTS_PER_WINDOW - 1)
+    # Cleanup handled by test_user_factory
+
+# 5. Basic "is it rate limited" test for another user endpoint (e.g. GET /presets)
+def test_list_presets_endpoint_is_rate_limited(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory("list_presets_rl")
+    token = access_token_factory(user_details)
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    endpoint_url = "/api/users/presets"
+
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        response = client.get(endpoint_url, headers=auth_headers)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Authenticated request {i+1} to {endpoint_url} rate limited prematurely.")
+        assert response.status_code == status.HTTP_200_OK
+
+    response = client.get(endpoint_url, headers=auth_headers)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    # Cleanup handled by test_user_factory
+
+# --- Advanced Rate Limiting Tests for User Endpoints ---
+import time
+
+# Assuming these constants are accessible from main or defined for tests
+try:
     from main import ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT
     ANON_REQUESTS_PER_WINDOW = int(ANON_USER_RATE_LIMIT.split('/')[0]) # Should not be used by user endpoints
     AUTH_REQUESTS_PER_WINDOW = int(AUTH_USER_RATE_LIMIT.split('/')[0])

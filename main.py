@@ -16,6 +16,7 @@ import io
 
 # JSONResponse is not strictly needed if returning Pydantic model with status_code
 # from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware # Import for CORS
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseCall
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse # Renamed to avoid conflict with FastAPI's Response
@@ -128,7 +129,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers['X-Frame-Options'] = 'DENY'
         # A starting point for CSP. Might need adjustment for specific frontend needs (CDNs, inline scripts, etc.)
         response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none';"
-        # HSTS: Only enable if ALWAYS served over HTTPS
+        # HSTS: Only enable if ALWAYS served over HTTPS.
+        # Note: While this application sets the HSTS header, actual HTTPS enforcement (SSL termination,
+        # HTTP to HTTPS redirection) should be handled by a reverse proxy (e.g., Nginx, Traefik)
+        # or a cloud load balancer in a production environment.
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
         return response
 
@@ -319,6 +323,18 @@ app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
 
 
 # Add middlewares to the application
+# CORS should typically be one of the first, if not the first.
+# However, if other middlewares might modify requests in ways that CORS should see,
+# or if CORS needs to act before them, adjust order.
+# For typical setup, CORS first is common.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Placeholder: Should be restricted in production via env var
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all standard methods
+    allow_headers=["*"], # Allows all headers
+)
+
 # SecurityHeadersMiddleware should ideally be one of the first
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)

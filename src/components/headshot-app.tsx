@@ -69,6 +69,7 @@ export default function HeadshotApp() {
   const [imageQualityAssessment, setImageQualityAssessment] = useState<ImageQualityAssessmentOutput | null>(null); 
   const [carouselSlides, setCarouselSlides] = useState<CarouselSlide[]>([]);
   const [isAssessingQuality, setIsAssessingQuality] = useState(false);
+  const [isUploading, setIsUploading] = useState(false); // New state for upload status
 
   const [isTestMode, setIsTestMode] = useState<boolean>(false);
   const [carouselApi, setCarouselApi] = useState<CarouselApi>();
@@ -212,59 +213,112 @@ export default function HeadshotApp() {
       ]);
   };
 
-  const processUploadedImage = async (dataUri: string) => {
-    setOriginalImage(dataUri); // Set original image first
-    setUploadedImage(dataUri); // Set uploaded image for preview filtering
-        
-     // Update carousel slides immediately to include the new original image
-     setCarouselSlides([
-       {
-         id: 'original',
-         title: 'Original Image',
-         imageSrc: dataUri,
-         altText: 'Original uploaded image',
-       },
-     ]);
-
-
+  // Refactored to handle File object and backend upload
+  const processUploadedImage = async (file: File) => {
+    setIsUploading(true);
+    setIsAssessingQuality(false); // Reset this as assessment is part of this flow now
+    setOriginalImage(null);
+    setUploadedImage(null);
+    setImageQualityAssessment(null);
     setEnhancementJourney(null);
     setSuggestionRationale(null);
-    setImageQualityAssessment(null);
     setEnhancementValues(initialEnhancements);
-    carouselApi?.scrollTo(0, true); // Go to first slide instantly
+    setCarouselSlides([]); // Clear previous slides
+    carouselApi?.scrollTo(0, true);
 
-    toast({
-      title: "Image Uploaded",
-      description: "Ready for enhancement. Assessing image quality...",
-    });
+    const formData = new FormData();
+    formData.append('file', file);
 
-    setIsAssessingQuality(true);
     try {
-      const assessmentResult = await assessImageQuality({ photoDataUri: dataUri });
-      setImageQualityAssessment(assessmentResult);
-      toast({
-        title: "Image Quality Assessed",
-        description: "Check the assessment panel for details.",
+      const response = await fetch('/api/images/upload', {
+        method: 'POST',
+        body: formData,
       });
-       // Wait for state update then scroll
-       setTimeout(() => carouselApi?.scrollTo(1, false), 100);
-    } catch (error) {
-      console.error("Error assessing image quality:", error);
+
+      if (!response.ok) {
+        let errorDetail = "Unknown error during upload.";
+        try {
+          const errorJson = await response.json();
+          errorDetail = errorJson.detail || errorDetail;
+        } catch (e) {
+          // Failed to parse error JSON
+          errorDetail = response.statusText || errorDetail;
+        }
+        toast({
+          title: "Upload Failed",
+          description: errorDetail,
+          variant: "destructive",
+        });
+        setOriginalImage(null); // Ensure states are cleared on failure
+        setUploadedImage(null);
+        setCarouselSlides([]);
+        return; // Exit early
+      }
+
+      // Backend confirmed upload (and moderation if applicable)
+      // const imageSchemaResponse = await response.json(); // ImageSchema for future use if needed
+
+      // Generate data URI for client-side operations (assessImageQuality, display)
+      const dataUri = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+
+      setOriginalImage(dataUri);
+      setUploadedImage(dataUri);
+      setCarouselSlides([
+        { id: 'original', title: 'Original Image', imageSrc: dataUri, altText: 'Original uploaded image' },
+      ]);
+
       toast({
-        title: "AI Assessment Error",
-        description: `Could not assess image quality. ${error instanceof Error ? error.message : ''}`,
+        title: "Image Uploaded",
+        description: "Successfully processed. Now assessing quality...",
+      });
+
+      // Now proceed with AI quality assessment
+      setIsAssessingQuality(true);
+      try {
+        const assessmentResult = await assessImageQuality({ photoDataUri: dataUri });
+        setImageQualityAssessment(assessmentResult);
+        // The useEffect for carouselSlides will add the assessment slide
+        toast({
+          title: "Image Quality Assessed",
+          description: "Check the assessment panel for details.",
+        });
+        // Wait for state update then scroll (useEffect for carouselSlides handles this better)
+      } catch (error) {
+        console.error("Error assessing image quality:", error);
+        toast({
+          title: "AI Assessment Error",
+          description: `Could not assess image quality. ${error instanceof Error ? error.message : ''}`,
+          variant: "destructive",
+        });
+        setImageQualityAssessment(null); // Clear assessment if it failed
+      } finally {
+        setIsAssessingQuality(false);
+      }
+
+    } catch (error) {
+      console.error("Error uploading file:", error);
+      toast({
+        title: "Upload Error",
+        description: `Could not upload image. ${error instanceof Error ? error.message : 'Please check your connection.'}`,
         variant: "destructive",
       });
-      setImageQualityAssessment(null);
+      setOriginalImage(null);
+      setUploadedImage(null);
+      setCarouselSlides([]);
     } finally {
-      setIsAssessingQuality(false);
+      setIsUploading(false);
     }
   };
 
   const handleImageUpload = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file && file.type.startsWith('image/')) {
-      if (file.size > 10 * 1024 * 1024) {
+      if (file.size > 10 * 1024 * 1024) { // 10MB limit
         toast({
           title: "File Too Large",
           description: "Please upload an image smaller than 10MB.",
@@ -272,13 +326,8 @@ export default function HeadshotApp() {
         });
         return;
       }
-
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const dataUri = reader.result as string;
-        processUploadedImage(dataUri);
-      };
-      reader.readAsDataURL(file);
+      // Call processUploadedImage with the File object
+      processUploadedImage(file);
     } else if (file) {
        toast({
          title: "Invalid File Type",
@@ -286,6 +335,7 @@ export default function HeadshotApp() {
          variant: "destructive",
        });
     }
+    // Reset file input to allow re-uploading the same file if needed
      if (fileInputRef.current) {
        fileInputRef.current.value = "";
      }
@@ -297,28 +347,24 @@ export default function HeadshotApp() {
     event.currentTarget.classList.remove('border-primary');
 
     const file = event.dataTransfer.files?.[0];
-     if (file && file.type.startsWith('image/')) {
-       if (file.size > 10 * 1024 * 1024) {
-         toast({
-           title: "File Too Large",
-           description: "Please upload an image smaller than 10MB.",
-           variant: "destructive",
-         });
-         return;
-       }
-       const reader = new FileReader();
-       reader.onloadend = () => {
-         const dataUri = reader.result as string;
-         processUploadedImage(dataUri);
-       };
-       reader.readAsDataURL(file);
-     } else if (file) {
+    if (file && file.type.startsWith('image/')) {
+      if (file.size > 10 * 1024 * 1024) { // 10MB limit
         toast({
-          title: "Invalid File Type",
-          description: "Please upload a valid image file (JPG, PNG, WEBP).",
+          title: "File Too Large",
+          description: "Please upload an image smaller than 10MB.",
           variant: "destructive",
         });
-     }
+        return;
+      }
+      // Call processUploadedImage with the File object
+      processUploadedImage(file);
+    } else if (file) {
+       toast({
+         title: "Invalid File Type",
+         description: "Please upload a valid image file (JPG, PNG, WEBP).",
+         variant: "destructive",
+       });
+    }
   };
 
    const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
@@ -602,6 +648,7 @@ export default function HeadshotApp() {
                 isAssessingQuality={isAssessingQuality}
                 isLoadingAI={isLoadingAI}
                 isProcessingEnhancement={isProcessingEnhancement}
+                isUploading={isUploading} // Pass new state
                 testImages={testImages}
                 selectedTestImage={selectedTestImage}
                 handleTestImageSelect={handleTestImageSelect}
@@ -642,20 +689,20 @@ export default function HeadshotApp() {
                         <CarouselPrevious 
                             variant="ghost" 
                             className="absolute left-2 top-1/2 -translate-y-1/2 z-10 bg-card/50 hover:bg-card/80 disabled:opacity-30"
-                            disabled={!carouselApi?.canScrollPrev() || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                            disabled={!carouselApi?.canScrollPrev() || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                         />
                         <CarouselNext 
                             variant="ghost" 
                             className="absolute right-2 top-1/2 -translate-y-1/2 z-10 bg-card/50 hover:bg-card/80 disabled:opacity-30"
-                            disabled={!carouselApi?.canScrollNext() || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                            disabled={!carouselApi?.canScrollNext() || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                         />
                     </>
                   )}
-                  {(isLoadingAI || isProcessingEnhancement || isAssessingQuality) && (
+                  {(isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading) && (
                       <div className="absolute inset-0 bg-background/80 flex flex-col items-center justify-center z-20 rounded-lg">
                         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
                         <p className="text-foreground text-lg font-medium">
-                          {isAssessingQuality ? 'AI Assessing Quality...' : (isLoadingAI ? 'AI Analyzing & Animating...' : 'Applying AI Enhancements...')}
+                          {isUploading ? 'Uploading Image...' : (isAssessingQuality ? 'AI Assessing Quality...' : (isLoadingAI ? 'AI Analyzing & Animating...' : 'Applying AI Enhancements...'))}
                         </p>
                       </div>
                   )}
@@ -753,7 +800,7 @@ export default function HeadshotApp() {
                                 step={0.01}
                                 value={[enhancementValues[key]]}
                                 onValueChange={(val) => handleSliderChange(key, val)}
-                                disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                                disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                                 aria-label={`${key} slider`}
                                 className="[&>span:last-child]:transition-transform [&>span:last-child]:duration-100 [&>span:last-child]:ease-linear h-2"
                               />
@@ -763,7 +810,7 @@ export default function HeadshotApp() {
                         <CardFooter className="flex flex-col gap-3 pt-4">
                           <Button
                             onClick={handleSuggestEnhancements}
-                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                             className="w-full"
                           >
                             <WandSparkles className="mr-2 h-4 w-4" /> Suggest &amp; Animate (AI)
@@ -771,7 +818,7 @@ export default function HeadshotApp() {
                           </Button>
                           <Button
                             onClick={handleApplyEnhancements}
-                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality}
+                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                             className="w-full bg-accent hover:bg-accent/90 text-accent-foreground"
                           >
                             Apply AI &amp; See Journey

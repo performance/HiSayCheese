@@ -3,3 +3,5 @@ uvicorn[standard]
 sqlalchemy
 pydantic
 python-magic
+google-cloud-vision>=3.0.0
+Pillow>=9.0.0

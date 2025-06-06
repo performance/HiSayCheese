@@ -104,6 +104,24 @@ HiSayCheese offers an innovative solution: users can simply upload a selfie, and
 *   A detailed project blueprint, **`docs/blueprint.md`**, has been drafted. This document outlines the core features, development phases, and initial design considerations for the "Headshot Handcrafter" concept, which is now evolving into HiSayCheese.
 *   The domain **`HiSayCheese.com` is owned** and will be the primary brand for the product.
 
+## Google Cloud Vision API Configuration
+
+This application uses the Google Cloud Vision API for content moderation (portrait and SafeSearch detection).
+To enable this functionality, you must configure authentication by setting the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+
+Steps:
+1. Create or use an existing Google Cloud Project.
+2. Enable the Cloud Vision API for your project.
+3. Create a service account.
+4. Grant the 'Cloud Vision AI User' role (or a custom role with `vision.images.annotate` permission) to the service account.
+5. Download the JSON key file for this service account.
+6. Securely store this key file on the server where the backend application runs.
+7. Set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable in your backend application's environment to the absolute path of this JSON key file.
+
+Example: `export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-file.json"`
+
+Ensure the backend application has this environment variable set when it starts.
+
 ## Project Naming
 
 *   **Primary Name:** HiSayCheese (utilizing the owned domain `HiSayCheese.com`)

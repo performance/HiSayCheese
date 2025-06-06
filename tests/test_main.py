@@ -186,4 +186,243 @@ def test_root_endpoint():
 #     print("CRITICAL: python-magic is NOT available in test environment.")
 #     pytest.fail("python-magic import failed in test file")
 
+# --- Unit Tests for Content Moderation ---
+from unittest.mock import MagicMock, patch
+# Assuming ContentModerationResult is accessible from main or models.models
+# If main.ContentModerationResult is pydantic model imported from pydantic
+# and models.ContentModerationResult is something else, ensure correct import.
+# Based on previous subtasks, ContentModerationResult is defined in main.py
+from main import moderate_image_content, ContentModerationResult
+from google.cloud import vision # For vision.Likelihood constants
+
+# Using the existing MINIMAL_WEBP_CONTENT for test image bytes
+# If a different one is needed, define it here. For mocking, content isn't deeply inspected by mocks.
+MINIMAL_WEBP_BYTES_FOR_MODERATION = MINIMAL_WEBP_CONTENT # Reuse if suitable
+
+@pytest.mark.asyncio # Mark test as async
+async def test_moderate_content_approved():
+    """Image is a clear portrait and has no prohibited content."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800) # width, height
+
+    mock_vision_client_instance = MagicMock()
+
+    # Mock face_detection response
+    mock_face_response = MagicMock()
+    mock_face = MagicMock()
+    mock_face.detection_confidence = 0.95
+    # Large face covering > 5% of 1000x800=800000 area. (600*600 = 360000, which is > 40000)
+    vertices = [MagicMock(x=100, y=100), MagicMock(x=700, y=100), MagicMock(x=700, y=700), MagicMock(x=100, y=700)]
+    # Ensure the vertices attribute is correctly assigned to bounding_poly
+    mock_face.bounding_poly.vertices = vertices
+    mock_face_response.face_annotations = [mock_face]
+    mock_face_response.error.message = ""
+    mock_vision_client_instance.face_detection.return_value = mock_face_response
+
+    # Mock safe_search_detection response
+    mock_safe_response = MagicMock()
+    mock_safe_annotation = MagicMock() # Create a separate mock for the annotation attribute
+    mock_safe_annotation.adult = vision.Likelihood.VERY_UNLIKELY
+    mock_safe_annotation.violence = vision.Likelihood.VERY_UNLIKELY
+    mock_safe_annotation.racy = vision.Likelihood.VERY_UNLIKELY
+    mock_safe_response.safe_search_annotation = mock_safe_annotation # Assign to the attribute
+    mock_safe_response.error.message = ""
+    mock_vision_client_instance.safe_search_detection.return_value = mock_safe_response
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is True
+        assert result.rejection_reason is None
+        mock_pil_open.assert_called_once_with(pytest.ANY) # Check PILImage.open was called
+        mock_vision_client_constructor.assert_called_once() # Check client was initialized
+        mock_vision_client_instance.face_detection.assert_called_once()
+        mock_vision_client_instance.safe_search_detection.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_moderate_content_no_face():
+    """Image has no face detected."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800)
+
+    mock_vision_client_instance = MagicMock()
+    mock_face_response = MagicMock()
+    mock_face_response.face_annotations = [] # No faces
+    mock_face_response.error.message = ""
+    mock_vision_client_instance.face_detection.return_value = mock_face_response
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert result.rejection_reason == "No clear portrait found or face is not prominent."
+        mock_pil_open.assert_called_once()
+        mock_vision_client_constructor.assert_called_once()
+        mock_vision_client_instance.face_detection.assert_called_once()
+        mock_vision_client_instance.safe_search_detection.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_moderate_content_face_too_small():
+    """Face detected but too small."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800)
+
+    mock_vision_client_instance = MagicMock()
+    mock_face_response = MagicMock()
+    mock_face = MagicMock()
+    mock_face.detection_confidence = 0.95
+    # Small face: 10x10 = 100 area. 5% of 800000 is 40000. This is < 5%.
+    vertices = [MagicMock(x=0, y=0), MagicMock(x=10, y=0), MagicMock(x=10, y=10), MagicMock(x=0, y=10)]
+    mock_face.bounding_poly.vertices = vertices
+    mock_face_response.face_annotations = [mock_face]
+    mock_face_response.error.message = ""
+    mock_vision_client_instance.face_detection.return_value = mock_face_response
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert result.rejection_reason == "No clear portrait found or face is not prominent."
+        mock_vision_client_instance.face_detection.assert_called_once()
+        mock_vision_client_instance.safe_search_detection.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_moderate_content_prohibited_adult():
+    """Portrait is fine, but adult content detected."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800)
+
+    mock_vision_client_instance = MagicMock()
+    mock_face_response = MagicMock()
+    mock_face = MagicMock()
+    mock_face.detection_confidence = 0.95
+    vertices = [MagicMock(x=100, y=100), MagicMock(x=700, y=100), MagicMock(x=700, y=700), MagicMock(x=100, y=700)]
+    mock_face.bounding_poly.vertices = vertices
+    mock_face_response.face_annotations = [mock_face]
+    mock_face_response.error.message = ""
+    mock_vision_client_instance.face_detection.return_value = mock_face_response
+
+    mock_safe_response = MagicMock()
+    mock_safe_annotation = MagicMock()
+    mock_safe_annotation.adult = vision.Likelihood.LIKELY # Prohibited
+    mock_safe_annotation.violence = vision.Likelihood.VERY_UNLIKELY
+    mock_safe_annotation.racy = vision.Likelihood.VERY_UNLIKELY
+    mock_safe_response.safe_search_annotation = mock_safe_annotation
+    mock_safe_response.error.message = ""
+    mock_vision_client_instance.safe_search_detection.return_value = mock_safe_response
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert "adult" in result.rejection_reason.lower() # Check specific reason if possible
+        assert result.rejection_reason == "Image content violates guidelines (adult, violence, or racy content detected)."
+        mock_vision_client_instance.face_detection.assert_called_once()
+        mock_vision_client_instance.safe_search_detection.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_moderate_content_vision_face_detection_api_error():
+    """Vision API returns an error during face detection."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800)
+
+    mock_vision_client_instance = MagicMock()
+    mock_face_response = MagicMock()
+    mock_face_response.face_annotations = []
+    mock_face_response.error.message = "API internal error" # Error message from API
+    mock_vision_client_instance.face_detection.return_value = mock_face_response
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert result.rejection_reason == "Face detection failed: API internal error"
+        mock_vision_client_instance.face_detection.assert_called_once()
+        mock_vision_client_instance.safe_search_detection.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_moderate_content_vision_safe_search_api_error():
+    """Vision API returns an error during safe search."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800)
+
+    mock_vision_client_instance = MagicMock()
+    mock_face_response = MagicMock()
+    mock_face = MagicMock()
+    mock_face.detection_confidence = 0.95
+    vertices = [MagicMock(x=100, y=100), MagicMock(x=700, y=100), MagicMock(x=700, y=700), MagicMock(x=100, y=700)]
+    mock_face.bounding_poly.vertices = vertices
+    mock_face_response.face_annotations = [mock_face]
+    mock_face_response.error.message = ""
+    mock_vision_client_instance.face_detection.return_value = mock_face_response
+
+    mock_safe_response = MagicMock()
+    # No safe_search_annotation if API itself errors out before populating it
+    mock_safe_response.error.message = "SafeSearch API internal error"
+    mock_vision_client_instance.safe_search_detection.return_value = mock_safe_response
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert result.rejection_reason == "SafeSearch detection failed: SafeSearch API internal error"
+        mock_vision_client_instance.face_detection.assert_called_once()
+        mock_vision_client_instance.safe_search_detection.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_moderate_content_pillow_error():
+    """Pillow fails to open the image."""
+    with patch('main.PILImage.open', side_effect=Exception("Pillow can't open this")) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient') as mock_vision_client_constructor: # Mock client so it's not called
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert result.rejection_reason == "Failed to process image properties."
+        mock_pil_open.assert_called_once()
+        mock_vision_client_constructor.assert_called_once() # Client is initialized before Pillow error in current code
+        # Depending on exact structure, client might not be called if Pillow fails early.
+        # The current code initializes client, then tries Pillow.
+        # mock_vision_client_constructor.return_value.face_detection.assert_not_called()
+        # mock_vision_client_constructor.return_value.safe_search_detection.assert_not_called()
+        # Let's check the mock_vision_client_instance calls if constructor was called
+        if mock_vision_client_constructor.called:
+            mock_vision_client_instance = mock_vision_client_constructor.return_value
+            mock_vision_client_instance.face_detection.assert_not_called()
+            mock_vision_client_instance.safe_search_detection.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_moderate_content_general_exception_during_api_call():
+    """A general (non-API error message) exception occurs during Vision API interaction."""
+    mock_image_pil = MagicMock()
+    mock_image_pil.size = (1000, 800)
+
+    mock_vision_client_instance = MagicMock()
+    # Simulate an error when face_detection is called, e.g. network issue
+    mock_vision_client_instance.face_detection.side_effect = Exception("Network timeout")
+
+    with patch('main.PILImage.open', return_value=mock_image_pil) as mock_pil_open, \
+         patch('main.vision.ImageAnnotatorClient', return_value=mock_vision_client_instance) as mock_vision_client_constructor:
+
+        result = await moderate_image_content(MINIMAL_WEBP_BYTES_FOR_MODERATION)
+
+        assert result.is_approved is False
+        assert result.rejection_reason == "Content moderation check failed due to an internal error."
+        mock_pil_open.assert_called_once()
+        mock_vision_client_constructor.assert_called_once()
+        mock_vision_client_instance.face_detection.assert_called_once() # Attempted
+        mock_vision_client_instance.safe_search_detection.assert_not_called() # Should not be reached
 ```

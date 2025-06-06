@@ -24,6 +24,7 @@ import logging # Added logging
 from typing import List # Added for FaceDetection models
 
 from services.face_detection import detect_faces # Added for face detection endpoint
+from services.image_quality import analyze_image_quality # New import
 
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
@@ -38,6 +39,16 @@ class FaceBoundingBox(BaseModel):
 class FaceDetectionResponse(BaseModel):
     faces: List[FaceBoundingBox]
     image_id: uuid.UUID # Changed from int
+    message: Optional[str] = None
+
+class ImageQualityMetrics(BaseModel):
+    brightness: float
+    contrast: float
+
+class ImageQualityAnalysisResponse(BaseModel):
+    image_id: uuid.UUID
+    quality_metrics: ImageQualityMetrics
+    insights: List[str]
     message: Optional[str] = None
 
 app = FastAPI()
@@ -380,3 +391,47 @@ async def get_face_detections(image_id: uuid.UUID, db: Session = Depends(get_db)
     except Exception as e:
         logger.error(f"An unexpected error occurred while detecting faces for image id {image_id} using local detection: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during face detection.")
+
+
+@app.get("/api/analysis/quality/{image_id}", response_model=ImageQualityAnalysisResponse)
+async def get_image_quality_analysis(image_id: uuid.UUID, db: Session = Depends(get_db)):
+    db_image = crud.get_image(db, image_id=image_id)
+    if not db_image:
+        logger.warning(f"Image quality analysis request for non-existent image_id: {image_id}")
+        raise HTTPException(status_code=404, detail=f"Image with id {image_id} not found.")
+
+    if not db_image.filepath:
+        logger.info(f"Filepath for image id {image_id} not available for quality analysis. Image status: {'approved' if not db_image.rejection_reason else f'rejected ({db_image.rejection_reason})'}")
+        raise HTTPException(status_code=404, detail=f"Filepath for image id {image_id} not available. The image might not have been processed or saved correctly.")
+
+    if not os.path.exists(db_image.filepath): # Check if file exists before analysis
+        logger.error(f"File not found for image id {image_id} at path: {db_image.filepath} during quality analysis attempt.")
+        raise HTTPException(status_code=404, detail=f"Image file not found at path {db_image.filepath}. It may have been moved or deleted.")
+
+    try:
+        logger.info(f"Attempting image quality analysis for image id {image_id} at path: {db_image.filepath}")
+
+        # Call the analysis function from the service
+        quality_data = analyze_image_quality(db_image.filepath)
+
+        metrics = ImageQualityMetrics(
+            brightness=quality_data["brightness"],
+            contrast=quality_data["contrast"]
+        )
+
+        return ImageQualityAnalysisResponse(
+            image_id=db_image.id,
+            quality_metrics=metrics,
+            insights=quality_data["insights"],
+            message="Image quality analysis successful."
+        )
+
+    except FileNotFoundError: # Should be caught by the os.path.exists check, but good to have
+        logger.error(f"File not found for image id {image_id} at path: {db_image.filepath} during quality analysis.")
+        raise HTTPException(status_code=404, detail=f"Image file not found for id {image_id} during analysis.")
+    except ValueError as e:
+        logger.error(f"Error processing image id {image_id} with quality analysis (ValueError): {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing image id {image_id}: Invalid image file or format. Details: {str(e)}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while analyzing image quality for id {image_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during image quality analysis.")

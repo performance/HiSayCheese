@@ -3,6 +3,7 @@ import uuid
 import magic
 import os # Added os import
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status # Added status
+import json # Added for EnhancementHistory
 from sqlalchemy.orm import Session
 from typing import Optional # Added Optional
 from pydantic import BaseModel # Added BaseModel import
@@ -20,6 +21,9 @@ from db import crud
 from models import models # This imports the models module
 # We need ImageCreate and ImageSchema for type hinting and response_model
 # from models.models import ImageCreate, ImageSchema # More specific imports
+# Corrected import for models to include User, EnhancementHistoryBase, ImageCreate
+from models import models # This imports the models module
+from models.models import User, EnhancementHistoryBase, ImageCreate # Added User, EnhancementHistoryBase, ImageCreate
 import logging # Added logging
 from typing import List # Added for FaceDetection models
 
@@ -30,6 +34,7 @@ from services.image_processing import apply_enhancements, ImageProcessingError #
 
 from routers import auth as auth_router # Import the auth router
 from routers import users as users_router # Import the users router
+from auth_utils import get_current_user # Added for current_user dependency
 
 # Pydantic model for content moderation result
 class ContentModerationResult(BaseModel): # Corrected to BaseModel
@@ -82,6 +87,10 @@ class EnhancementRequestParams(BaseModel): # Mirrors EnhancementParameters
 class ImageEnhancementRequest(BaseModel):
     image_id: uuid.UUID
     parameters: EnhancementRequestParams
+
+# Pydantic model for Apply Preset Request
+class ApplyPresetRequest(BaseModel):
+    image_id: uuid.UUID
 
 # Pydantic model for Processed Image Response
 class ProcessedImageResponse(BaseModel):
@@ -565,9 +574,10 @@ async def get_auto_enhancement_parameters(
 @app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
 async def apply_image_enhancements_endpoint(
     request: ImageEnhancementRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user) # Added current_user
 ):
-    logger.info(f"Received request to apply enhancements for image_id: {request.image_id}")
+    logger.info(f"Received request to apply enhancements for image_id: {request.image_id} by user: {current_user.id}") # Log user
 
     db_image = crud.get_image(db, image_id=request.image_id)
     if not db_image:
@@ -657,10 +667,56 @@ async def apply_image_enhancements_endpoint(
         logger.info(f"Apply Enhancement: Saving processed image for id {request.image_id} to {processed_image_filepath}")
         processed_pil_image.save(processed_image_filepath, format='PNG')
 
-        # For now, processed_image_id is None as we are not creating a new DB record.
+        # Initialize variables for processed image record and ID
+        db_processed_image_record = None
+        processed_image_id_for_response = None
+
+        try:
+            # 3. Create an Image record for the processed image
+            processed_image_filesize = os.path.getsize(processed_image_filepath)
+            processed_image_width, processed_image_height = processed_pil_image.size
+            processed_image_format = processed_pil_image.format if processed_pil_image.format else 'PNG'
+
+
+            image_create_data = ImageCreate(
+                filename=new_filename,
+                filepath=processed_image_filepath,
+                filesize=processed_image_filesize,
+                mimetype='image/png', # Explicitly PNG as we save in this format
+                width=processed_image_width,
+                height=processed_image_height,
+                format=processed_image_format
+                # exif_orientation and color_profile can be None or copied if available/relevant
+            )
+            db_processed_image_record = crud.create_image(
+                db=db,
+                image=image_create_data,
+                width=image_create_data.width,
+                height=image_create_data.height,
+                format=image_create_data.format
+            )
+            processed_image_id_for_response = db_processed_image_record.id
+            logger.info(f"Apply Enhancement: Created DB record for processed image with ID: {db_processed_image_record.id}")
+
+            # 5. Create EnhancementHistory record
+            parameters_json_str = json.dumps(request.parameters.model_dump())
+            history_create_data = EnhancementHistoryBase(
+                original_image_id=db_image.id, # original image ID
+                processed_image_id=db_processed_image_record.id, # new processed image ID
+                parameters_json=parameters_json_str
+            )
+            crud.create_enhancement_history(db=db, history_data=history_create_data, user_id=current_user.id)
+            logger.info(f"Apply Enhancement: Enhancement history record created for user {current_user.id}, original image {db_image.id}, processed image {db_processed_image_record.id}")
+
+        except Exception as db_error:
+            # Log DB errors but don't fail the entire request if file was saved
+            logger.error(f"Apply Enhancement: Error during DB operations (saving processed image record or history) for original image id {request.image_id}: {db_error}", exc_info=True)
+            # The processed_image_id_for_response might be None if create_image failed, or set if history creation failed.
+            # This is acceptable as per error handling guidelines (prioritize returning image path).
+
         return ProcessedImageResponse(
             original_image_id=request.image_id,
-            processed_image_id=None,
+            processed_image_id=processed_image_id_for_response, # This will be None if DB op failed before setting it
             processed_image_path=processed_image_filepath,
             message="Image enhancements applied and saved successfully."
         )
@@ -678,3 +734,118 @@ async def apply_image_enhancements_endpoint(
             message="An unexpected error occurred while saving the processed image.",
             error=str(e)
         )
+
+
+@app.post("/api/enhancement/apply-preset/{preset_id}", response_model=ProcessedImageResponse)
+async def apply_preset_to_image_endpoint(
+    preset_id: uuid.UUID,
+    request_data: ApplyPresetRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    logger.info(f"User {current_user.id} applying preset {preset_id} to image {request_data.image_id}")
+
+    # 1. Fetch the User Preset
+    db_preset = crud.get_user_preset(db, preset_id=preset_id, user_id=current_user.id)
+    if not db_preset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preset not found or not owned by user")
+
+    # 2. Parse Preset Parameters
+    try:
+        preset_parameters_dict = json.loads(db_preset.parameters_json)
+        # Validate/convert to EnhancementRequestParams Pydantic model
+        enhancement_params = EnhancementRequestParams(**preset_parameters_dict)
+    except json.JSONDecodeError:
+        logger.error(f"Preset {preset_id} has invalid JSON parameters: {db_preset.parameters_json}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Preset contains invalid parameters format.")
+    except Exception as e: # Catches Pydantic validation errors too
+        logger.error(f"Preset {preset_id} parameters validation failed: {e}. Parameters: {db_preset.parameters_json}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Preset parameters are invalid: {e}")
+
+    # 3. Fetch the Original Image (similar to apply_image_enhancements_endpoint)
+    db_image = crud.get_image(db, image_id=request_data.image_id)
+    if not db_image:
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Image with id {request_data.image_id} not found.")
+    if not db_image.filepath:
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Filepath for image id {request_data.image_id} not available.")
+    if not os.path.exists(db_image.filepath):
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error=f"Image file not found at path {db_image.filepath}.")
+
+    # 4. Face Detection (if needed)
+    face_results = []
+    if enhancement_params.face_smooth_intensity > 0:
+        try:
+            face_results = detect_faces(db_image.filepath)
+        except Exception as e:
+            logger.error(f"Apply Preset: Error during face detection for image {request_data.image_id}: {e}", exc_info=True)
+            # Proceed without face_results, or return error if critical
+            face_results = []
+
+    # 5. Apply Enhancements
+    processed_pil_image: Optional[PILImage.Image] = None
+    try:
+        processed_pil_image = apply_enhancements(
+            image_path=db_image.filepath,
+            params=enhancement_params.model_dump(),
+            face_detection_results=face_results
+        )
+    except ImageProcessingError as e:
+        logger.error(f"Apply Preset: ImageProcessingError for image {request_data.image_id} with preset {preset_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset due to processing error.", error=str(e))
+    except Exception as e:
+        logger.error(f"Apply Preset: Unexpected error during image processing for image {request_data.image_id} with preset {preset_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset due to an unexpected server error.", error=str(e))
+
+    if processed_pil_image is None:
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to apply preset.", error="Image processing returned no result.")
+
+    # 6. Save Processed Image and Record History
+    try:
+        os.makedirs(PROCESSED_UPLOAD_DIR, exist_ok=True)
+        new_filename = f"{db_image.id}_preset_enhanced_{uuid.uuid4().hex}.png"
+        processed_image_filepath = os.path.join(PROCESSED_UPLOAD_DIR, new_filename)
+        processed_pil_image.save(processed_image_filepath, format='PNG')
+
+        db_processed_image_record = None
+        processed_image_id_for_response = None
+        try:
+            processed_image_filesize = os.path.getsize(processed_image_filepath)
+            processed_image_width, processed_image_height = processed_pil_image.size
+            img_create_data = ImageCreate(
+                filename=new_filename, filepath=processed_image_filepath, filesize=processed_image_filesize,
+                mimetype='image/png', width=processed_image_width, height=processed_image_height,
+                format=processed_pil_image.format if processed_pil_image.format else 'PNG'
+            )
+            db_processed_image_record = crud.create_image(db=db, image=img_create_data, width=img_create_data.width, height=img_create_data.height, format=img_create_data.format)
+            processed_image_id_for_response = db_processed_image_record.id
+            logger.info(f"Apply Preset: Created DB record for processed image {db_processed_image_record.id}")
+
+            # Create EnhancementHistory record, noting the preset used
+            history_params_dict = enhancement_params.model_dump()
+            history_params_dict["applied_preset_id"] = str(preset_id) # Add preset ID to history
+            parameters_json_for_history = json.dumps(history_params_dict)
+
+            history_create_data = EnhancementHistoryBase(
+                original_image_id=db_image.id,
+                processed_image_id=db_processed_image_record.id,
+                parameters_json=parameters_json_for_history
+            )
+            crud.create_enhancement_history(db=db, history_data=history_create_data, user_id=current_user.id)
+            logger.info(f"Apply Preset: Enhancement history created for user {current_user.id}, original image {db_image.id}, processed {db_processed_image_record.id}, preset {preset_id}")
+
+        except Exception as db_error:
+            logger.error(f"Apply Preset: DB error for original image {request_data.image_id}, preset {preset_id}: {db_error}", exc_info=True)
+            # Return image path even if DB history fails
+
+        return ProcessedImageResponse(
+            original_image_id=request_data.image_id,
+            processed_image_id=processed_image_id_for_response,
+            processed_image_path=processed_image_filepath,
+            message="Preset applied and image saved successfully."
+        )
+    except IOError as e:
+        logger.error(f"Apply Preset: Failed to save processed image for {request_data.image_id}, preset {preset_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="Failed to save processed image after applying preset.", error=str(e))
+    except Exception as e:
+        logger.error(f"Apply Preset: Unexpected error saving image for {request_data.image_id}, preset {preset_id}: {e}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_data.image_id, message="An unexpected error occurred while saving the processed image using preset.", error=str(e))

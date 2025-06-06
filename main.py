@@ -237,18 +237,54 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
     # os.makedirs(UPLOAD_DIR, exist_ok=True) # Moved down
 
     # Initial ImageCreate data, filepath might be updated if approved
+    # Extract metadata using Pillow
+    img_width, img_height, img_format, exif_orientation, color_profile = None, None, None, None, None
+    try:
+        image_pil = PILImage.open(io.BytesIO(contents))
+        img_width, img_height = image_pil.size
+        img_format = image_pil.format
+
+        # EXIF Orientation
+        exif_data = image_pil._getexif()
+        if exif_data:
+            exif_orientation = exif_data.get(0x0112) # EXIF Orientation tag
+
+        # Color Profile
+        if image_pil.info.get('icc_profile'):
+            color_profile = "ICC"
+        else:
+            color_profile = image_pil.mode # e.g., 'RGB', 'RGBA', 'L'
+
+    except Exception as e:
+        logger.error(f"Error extracting metadata with Pillow: {e}")
+        # Decide if this is fatal or if we proceed with None for metadata
+        # For now, proceed with None, as these fields are optional
+
     image_data_to_create = models.ImageCreate(
         filename=file.filename,
         filepath=None, # Default to None, set if image is approved and saved
         filesize=file_size,
         mimetype=actual_content_type,
+        width=img_width,
+        height=img_height,
+        format=img_format,
+        exif_orientation=exif_orientation,
+        color_profile=color_profile,
         rejection_reason=moderation_result.rejection_reason
     )
 
     if not moderation_result.is_approved:
         logger.info(f"Image rejected: {moderation_result.rejection_reason}. Original filename: {file.filename}")
         # Save metadata for rejected image, filepath is None as file is not saved.
-        db_image = crud.create_image(db=db, image=image_data_to_create)
+        db_image = crud.create_image(
+            db=db,
+            image=image_data_to_create,
+            width=image_data_to_create.width,
+            height=image_data_to_create.height,
+            format=image_data_to_create.format,
+            exif_orientation=image_data_to_create.exif_orientation,
+            color_profile=image_data_to_create.color_profile
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=moderation_result.rejection_reason
@@ -278,6 +314,16 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
             )
 
         # Ensure rejection_reason is explicitly None for approved images in the database
-        image_data_to_create.rejection_reason = None
-        db_image = crud.create_image(db=db, image=image_data_to_create)
+        image_data_to_create.rejection_reason = None # This is already part of image_data_to_create
+
+        # Pass all required fields to crud.create_image
+        db_image = crud.create_image(
+            db=db,
+            image=image_data_to_create, # contains filename, filepath, filesize, mimetype, rejection_reason
+            width=image_data_to_create.width,
+            height=image_data_to_create.height,
+            format=image_data_to_create.format,
+            exif_orientation=image_data_to_create.exif_orientation,
+            color_profile=image_data_to_create.color_profile
+        )
         return db_image

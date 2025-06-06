@@ -186,8 +186,13 @@ def test_root_endpoint():
 #     print("CRITICAL: python-magic is NOT available in test environment.")
 #     pytest.fail("python-magic import failed in test file")
 
+import io # Added io
+from typing import Optional # Added Optional
+from PIL import Image as PILImage # Added PILImage for creating test images
+from PIL import ExifTags # Added ExifTags for creating exif data
+
 # --- Unit Tests for Content Moderation ---
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, mock_open
 # Assuming ContentModerationResult is accessible from main or models.models
 # If main.ContentModerationResult is pydantic model imported from pydantic
 # and models.ContentModerationResult is something else, ensure correct import.
@@ -402,6 +407,200 @@ async def test_moderate_content_pillow_error():
             mock_vision_client_instance = mock_vision_client_constructor.return_value
             mock_vision_client_instance.face_detection.assert_not_called()
             mock_vision_client_instance.safe_search_detection.assert_not_called()
+
+
+# --- Helper functions for creating dummy image files ---
+def create_dummy_image_bytes(
+    width: int,
+    height: int,
+    img_format: str = "JPEG",
+    exif_dict: Optional[dict] = None
+) -> bytes:
+    """
+    Creates dummy image bytes with specified properties.
+    exif_dict: A dictionary where keys are EXIF tag IDs and values are the tag values.
+               Example: {0x0112: 3} for orientation.
+    """
+    img_byte_arr = io.BytesIO()
+    image = PILImage.new("RGB", (width, height), color="blue")
+
+    exif_bytes = b""
+    if exif_dict:
+        exif = PILImage.Exif()
+        for tag, value in exif_dict.items():
+            exif[tag] = value
+        exif_bytes = exif.tobytes()
+
+    if img_format.upper() == "JPEG":
+        # Ensure exif data is only passed for JPEG and if it exists
+        if exif_bytes:
+            image.save(img_byte_arr, format="JPEG", exif=exif_bytes)
+        else:
+            image.save(img_byte_arr, format="JPEG")
+    elif img_format.upper() == "PNG":
+        image.save(img_byte_arr, format="PNG")
+    else:
+        raise ValueError(f"Unsupported image format for dummy creation: {img_format}")
+
+    return img_byte_arr.getvalue()
+
+# --- Fixtures for Metadata Tests ---
+
+@pytest.fixture
+def mock_moderate_content_approve_fixture(mocker):
+    """Mocks moderate_image_content to always return approved."""
+    # This mock will be applied to 'main.moderate_image_content'
+    return mocker.patch(
+        "main.moderate_image_content",
+        return_value=ContentModerationResult(is_approved=True, rejection_reason=None)
+    )
+
+@pytest.fixture
+def mock_file_system_operations_fixture(mocker):
+    """Mocks file system operations like open, makedirs, path.join for uploads."""
+    mocker.patch("os.makedirs") # Mock os.makedirs
+    # Mock builtins.open for writing the file, allow read for other parts of app if necessary
+    # For the upload, we are interested in the 'wb' mode.
+    mock_file_open = mock_open()
+    mocker.patch("builtins.open", mock_file_open)
+
+    # Mock os.path.join to control the returned filepath string for assertions
+    # The actual value might need to be dynamic or based on input filename if tests need it
+    # For now, a static path is fine as long as it's consistent.
+    # UPLOAD_DIR is "uploads/images/"
+    mock_join = mocker.patch("os.path.join", return_value=f"{UPLOAD_DIR.rstrip('/')}/mock_saved_file.jpg")
+
+    return {
+        "open": mock_file_open,
+        "makedirs": os.makedirs, # Access the original mock if needed for assertions
+        "join": mock_join
+    }
+
+
+# --- Test Cases for Image Upload Metadata ---
+
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+class TestImageUploadMetadata:
+
+    def test_upload_jpeg_metadata(self, client):
+        img_bytes = create_dummy_image_bytes(width=120, height=80, img_format="JPEG")
+        filesize = len(img_bytes)
+
+        response = client.post(
+            "/api/images/upload",
+            files={"file": ("test.jpg", io.BytesIO(img_bytes), "image/jpeg")}
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.text
+        data = response.json()
+
+        assert data["filename"] == "test.jpg"
+        assert data["mimetype"] == "image/jpeg"
+        assert data["filesize"] == filesize
+        assert data["width"] == 120
+        assert data["height"] == 80
+        assert data["format"] == "JPEG"
+        assert data["exif_orientation"] is None # Default JPEG from Pillow might not have it
+        assert data["color_profile"] == "RGB" # Pillow default RGB
+        assert data["rejection_reason"] is None
+        assert UPLOAD_DIR in data["filepath"] # Path comes from mock_file_system_operations_fixture
+
+    def test_upload_png_metadata(self, client):
+        img_bytes = create_dummy_image_bytes(width=100, height=60, img_format="PNG")
+        filesize = len(img_bytes)
+
+        response = client.post(
+            "/api/images/upload",
+            files={"file": ("test.png", io.BytesIO(img_bytes), "image/png")}
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.text
+        data = response.json()
+
+        assert data["filename"] == "test.png"
+        assert data["mimetype"] == "image/png"
+        assert data["filesize"] == filesize
+        assert data["width"] == 100
+        assert data["height"] == 60
+        assert data["format"] == "PNG"
+        assert data["exif_orientation"] is None # PNGs typically don't have EXIF
+        assert data["color_profile"] == "RGB" # Pillow default RGB for PNG
+        assert data["rejection_reason"] is None
+        assert UPLOAD_DIR in data["filepath"]
+
+    def test_upload_jpeg_with_exif_orientation(self, client):
+        orientation_tag_id = 0x0112 # Orientation
+        orientation_value = 3 # Rotate 180 degrees
+        img_bytes = create_dummy_image_bytes(
+            width=150, height=100, img_format="JPEG",
+            exif_dict={orientation_tag_id: orientation_value}
+        )
+        filesize = len(img_bytes)
+
+        response = client.post(
+            "/api/images/upload",
+            files={"file": ("exif_test.jpg", io.BytesIO(img_bytes), "image/jpeg")}
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.text
+        data = response.json()
+
+        assert data["width"] == 150
+        assert data["height"] == 100
+        assert data["format"] == "JPEG"
+        assert data["filesize"] == filesize
+        assert data["exif_orientation"] == orientation_value
+        assert data["color_profile"] == "RGB"
+        assert data["rejection_reason"] is None
+
+    def test_upload_jpeg_no_exif_data(self, client):
+        # create_dummy_image_bytes by default creates JPEG with no EXIF unless specified
+        img_bytes = create_dummy_image_bytes(width=80, height=50, img_format="JPEG")
+        filesize = len(img_bytes)
+
+        response = client.post(
+            "/api/images/upload",
+            files={"file": ("no_exif.jpg", io.BytesIO(img_bytes), "image/jpeg")}
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.text
+        data = response.json()
+
+        assert data["width"] == 80
+        assert data["height"] == 50
+        assert data["format"] == "JPEG"
+        assert data["filesize"] == filesize
+        assert data["exif_orientation"] is None
+        assert data["color_profile"] == "RGB"
+        assert data["rejection_reason"] is None
+
+    def test_upload_jpeg_minimal_exif_no_orientation(self, client):
+        # Provide some other EXIF tag, but not orientation
+        other_exif_tag_id = 0x010F # Make (Camera Manufacturer)
+        other_exif_value = "TestCam"
+        img_bytes = create_dummy_image_bytes(
+            width=70, height=40, img_format="JPEG",
+            exif_dict={other_exif_tag_id: other_exif_value}
+        )
+        filesize = len(img_bytes)
+
+        response = client.post(
+            "/api/images/upload",
+            files={"file": ("minimal_exif.jpg", io.BytesIO(img_bytes), "image/jpeg")}
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.text
+        data = response.json()
+
+        assert data["width"] == 70
+        assert data["height"] == 40
+        assert data["format"] == "JPEG"
+        assert data["filesize"] == filesize
+        assert data["exif_orientation"] is None # Orientation tag was not included
+        assert data["color_profile"] == "RGB"
+        assert data["rejection_reason"] is None
+        # Check if other EXIF might have been unintentionally parsed (it shouldn't be by current main.py logic)
+        # This test primarily ensures exif_orientation is None.
 
 
 @pytest.mark.asyncio

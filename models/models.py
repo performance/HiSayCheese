@@ -5,7 +5,7 @@ from typing import Optional
 from sqlalchemy import Column, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 Base = declarative_base()
 
@@ -30,6 +30,31 @@ class Image(Base):
     color_profile = Column(String, nullable=True)
     rejection_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Pydantic schemas for User
+class UserBase(BaseModel):
+    email: EmailStr
+
+class UserCreate(UserBase):
+    password: str # min_length=8 will be handled by endpoint logic
+
+class UserSchema(UserBase):
+    id: uuid.UUID
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
 
 class NumberBase(BaseModel):
     value: int

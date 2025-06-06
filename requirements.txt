@@ -10,3 +10,4 @@ numpy
 mediapipe
 passlib[bcrypt]
 email-validator
+python-jose[cryptography]

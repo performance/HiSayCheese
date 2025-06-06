@@ -9,9 +9,11 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from main import app
-from db.database import SessionLocal, create_db_and_tables
-from models.models import User as UserModel # Renamed to avoid conflict with User schema if any
-from auth_utils import verify_password # To check if password is not plain
+from db.database import SessionLocal # create_db_and_tables might not be needed here if main handles it
+from models.models import User as UserModel
+from auth_utils import verify_password
+from jose import jwt
+from config import SECRET_KEY, ALGORITHM
 
 # Create tables if they don't exist (e.g., for in-memory DB or first run)
 # This is generally handled by main.py on startup, but explicit call can be useful
@@ -128,6 +130,82 @@ def test_register_user_weak_password():
     assert response.status_code == 422, response.text
     data = response.json()
     assert data["detail"] == "Password must be at least 8 characters long."
+
+
+# Tests for /api/auth/login
+def test_login_success(db_session: Session):
+    user_email = f"testlogin_{uuid.uuid4()}@example.com"
+    user_password = "ValidPassword123"
+
+    # 1. Register user
+    reg_response = client.post(
+        "/api/auth/register",
+        json={"email": user_email, "password": user_password},
+    )
+    assert reg_response.status_code == 201, f"Registration failed: {reg_response.text}"
+    user_id_from_reg = reg_response.json().get("id") # Get user_id for later assertion
+
+    # 2. Login with the registered user
+    login_response = client.post(
+        "/api/auth/login",
+        data={"username": user_email, "password": user_password}, # Form data
+    )
+    assert login_response.status_code == 200, login_response.text
+    login_data = login_response.json()
+    assert "access_token" in login_data
+    assert login_data["token_type"] == "bearer"
+
+    # 3. Decode token and verify claims
+    access_token = login_data["access_token"]
+    try:
+        decoded_token = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.JWTError as e:
+        pytest.fail(f"Failed to decode token: {e}")
+
+    assert decoded_token["sub"] == user_email
+    assert "user_id" in decoded_token
+    assert decoded_token["user_id"] == user_id_from_reg # Check if user_id matches
+    assert "exp" in decoded_token
+    assert isinstance(decoded_token["exp"], int)
+
+    # Cleanup
+    clear_user_from_db(db_session, user_email)
+
+
+def test_login_invalid_email():
+    response = client.post(
+        "/api/auth/login",
+        data={"username": f"nosuchuser_{uuid.uuid4()}@example.com", "password": "anypassword"},
+    )
+    assert response.status_code == 401, response.text
+    data = response.json()
+    assert data["detail"] == "Incorrect email or password"
+
+
+def test_login_incorrect_password(db_session: Session):
+    user_email = f"testpwuser_{uuid.uuid4()}@example.com"
+    correct_password = "CorrectPassword123"
+    incorrect_password = "IncorrectPassword456"
+
+    # 1. Register user
+    reg_response = client.post(
+        "/api/auth/register",
+        json={"email": user_email, "password": correct_password},
+    )
+    assert reg_response.status_code == 201, f"Registration failed: {reg_response.text}"
+
+    # 2. Attempt login with incorrect password
+    login_response = client.post(
+        "/api/auth/login",
+        data={"username": user_email, "password": incorrect_password},
+    )
+    assert login_response.status_code == 401, login_response.text
+    data = login_response.json()
+    assert data["detail"] == "Incorrect email or password"
+
+    # Cleanup
+    clear_user_from_db(db_session, user_email)
+
 
 # Note: For a robust test suite, especially with database interactions:
 # 1. Use a separate test database (e.g., in-memory SQLite or a dedicated test PostgreSQL DB).

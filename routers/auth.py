@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 
 from fastapi.security import OAuth2PasswordRequestForm
@@ -6,6 +6,7 @@ from db.database import get_db
 from db import crud
 from models.models import UserCreate, UserSchema # User model itself is used via crud.get_user_by_email
 from auth_utils import verify_password, create_access_token
+from ..main import limiter, get_dynamic_rate_limit # Import limiter and the dynamic rate limit function
 
 router = APIRouter(
     prefix="/api/auth",
@@ -14,13 +15,9 @@ router = APIRouter(
 )
 
 @router.post("/register", response_model=UserSchema, status_code=status.HTTP_201_CREATED)
-def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    # Password Strength Check
-    if len(user.password) < 8:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Password must be at least 8 characters long.",
-        )
+@limiter.limit(get_dynamic_rate_limit) # Use the dynamic rate limit function
+def register_user(request: Request, user: UserCreate, db: Session = Depends(get_db)):
+    # Password strength (including length) is now handled by Pydantic model UserCreate
 
     # Check for existing user
     db_user = crud.get_user_by_email(db, email=user.email)
@@ -35,7 +32,8 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     return created_user
 
 @router.post("/login") # Or use "/token" for OAuth2 convention
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+@limiter.limit(get_dynamic_rate_limit) # Use the dynamic rate limit function
+async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = crud.get_user_by_email(db, email=form_data.username)
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(

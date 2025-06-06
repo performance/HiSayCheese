@@ -455,6 +455,418 @@ def mock_moderate_content_approve_fixture(mocker):
         return_value=ContentModerationResult(is_approved=True, rejection_reason=None)
     )
 
+
+# --- CORS Tests ---
+TEST_ORIGIN = "http://example.com"
+
+def test_cors_basic_get_request_with_origin(client: TestClient):
+    response = client.get("/", headers={"Origin": TEST_ORIGIN})
+    assert response.status_code == 200
+    # When allow_origins is ["*"], FastAPI/Starlette typically returns "*"
+    assert response.headers.get("Access-Control-Allow-Origin") == "*"
+    assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+
+def test_cors_preflight_options_request(client: TestClient):
+    request_headers = {
+        "Origin": TEST_ORIGIN,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "Content-Type, Authorization",
+    }
+    response = client.options("/", headers=request_headers)
+    assert response.status_code == 200
+
+    # For ["*"], server might return "*" or echo the specific origin.
+    # FastAPI's default behavior for ["*"] is to return the specific origin for preflight.
+    assert response.headers.get("Access-Control-Allow-Origin") == TEST_ORIGIN
+
+    # Check if allowed methods from request are present or if it's "*"
+    allowed_methods = response.headers.get("Access-Control-Allow-Methods")
+    assert allowed_methods is not None
+    if "*" not in allowed_methods:
+        assert "POST" in allowed_methods.upper()
+
+    # Check if allowed headers from request are present or if it's "*"
+    allowed_headers = response.headers.get("Access-Control-Allow-Headers")
+    assert allowed_headers is not None
+    if "*" not in allowed_headers:
+        requested_headers = set(h.strip().lower() for h in "Content-Type, Authorization".lower().split(','))
+        returned_allowed_headers = set(h.strip().lower() for h in allowed_headers.split(','))
+        assert requested_headers.issubset(returned_allowed_headers)
+
+    assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+    # Optional: Check for Access-Control-Max-Age if you expect it
+    # assert "Access-Control-Max-Age" in response.headers
+
+
+# --- Helper for Advanced Rate Limit Tests ---
+import time # For rate limit reset tests
+
+# Assuming these constants are accessible from main or defined for tests
+try:
+    from main import ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT
+    ANON_REQUESTS_PER_WINDOW = int(ANON_USER_RATE_LIMIT.split('/')[0])
+    AUTH_REQUESTS_PER_WINDOW = int(AUTH_USER_RATE_LIMIT.split('/')[0])
+except ImportError:
+    ANON_REQUESTS_PER_WINDOW = 20 # Fallback, ensure matches main.py
+    AUTH_REQUESTS_PER_WINDOW = 100 # Fallback, ensure matches main.py
+
+def get_rate_limit_headers_from_response(response): # Renamed to avoid conflict with test_auth.py if merged
+    return {
+        "limit": response.headers.get("X-RateLimit-Limit"),
+        "remaining": response.headers.get("X-RateLimit-Remaining"),
+        "reset": response.headers.get("X-RateLimit-Reset"),
+    }
+
+# Helper to create a temporary user and get a token for authenticated tests
+def create_user_and_get_token(client_instance, db_session_instance, email_prefix="auth_test_user"):
+    user_email = f"{email_prefix}_{uuid.uuid4()}@example.com"
+    user_password = "ValidPasswordForTesting1!"
+
+    reg_response = client_instance.post(
+        "/api/auth/register",
+        json={"email": user_email, "password": user_password},
+    )
+    if reg_response.status_code != status.HTTP_201_CREATED:
+        # Try to clear if user somehow exists from a failed previous run
+        db = SessionLocal()
+        existing_user = db.query(models.User).filter(models.User.email == user_email).first()
+        if existing_user:
+            db.delete(existing_user)
+            db.commit()
+        db.close()
+        reg_response = client_instance.post( # Retry registration
+            "/api/auth/register", json={"email": user_email, "password": user_password}
+        )
+
+    assert reg_response.status_code == status.HTTP_201_CREATED, \
+        f"Failed to register user for token generation: {reg_response.text}"
+
+    login_response = client_instance.post(
+        "/api/auth/login",
+        data={"username": user_email, "password": user_password},
+    )
+    assert login_response.status_code == status.HTTP_200_OK, \
+        f"Failed to login user for token generation: {login_response.text}"
+
+    token = login_response.json()["access_token"]
+
+    # Store email for cleanup if needed, or rely on test-scoped DB fixtures
+    # For now, caller should handle cleanup or use appropriate DB fixtures.
+    return token, user_email
+
+# Copied from test_auth.py for now, ideally should be in a shared conftest.py or utils
+def clear_user_from_db(db: Session, email: str):
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user:
+        db.delete(user)
+        db.commit()
+
+# --- Security Headers Test ---
+def test_security_headers_present():
+    response = client.get("/") # Any endpoint should have these headers
+    assert response.status_code == 200
+    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+    assert response.headers.get("X-Frame-Options") == "DENY"
+    assert "default-src 'self'" in response.headers.get("Content-Security-Policy")
+    assert "script-src 'self'" in response.headers.get("Content-Security-Policy")
+    assert "object-src 'none'" in response.headers.get("Content-Security-Policy")
+    assert "frame-ancestors 'none'" in response.headers.get("Content-Security-Policy")
+    # HSTS is often only sent over HTTPS, TestClient uses HTTP by default.
+    # If app is configured to force HTTPS or TestClient to use HTTPS, this can be asserted.
+    # For now, we'll assume it might not be present in basic HTTP test environment.
+    # assert "max-age=31536000" in response.headers.get("Strict-Transport-Security", "")
+
+
+# --- Request Body Size Limit Test ---
+# Using /put_number endpoint for testing general JSON payload size limit
+# MAX_REQUEST_BODY_SIZE is 1MB in main.py
+# MAX_FILE_SIZE_BYTES is for file uploads (larger)
+
+# Need to get MAX_REQUEST_BODY_SIZE from main.py for the test
+from main import MAX_REQUEST_BODY_SIZE as APP_MAX_REQUEST_BODY_SIZE
+
+def test_request_body_too_large_for_json_endpoint():
+    # Create a payload slightly larger than MAX_REQUEST_BODY_SIZE
+    # The /put_number endpoint expects {"value": int}
+    # We'll send a large string for "value" to make the JSON large,
+    # though the endpoint will fail validation (422) if it gets that far.
+    # The middleware should intercept it with 413 before Pydantic validation.
+    # However, a simple way is to make the key itself large or many keys.
+    # Let's try making a large number of key-value pairs.
+    large_payload_dict = {}
+    # Approximate size: each pair "keyX": 0, is about 10 bytes.
+    # So, for 1MB, we need about 100,000 pairs.
+    num_pairs = (APP_MAX_REQUEST_BODY_SIZE // 10) + 100 # Ensure it's over
+    for i in range(num_pairs):
+        large_payload_dict[f"key{i}"] = i
+
+    # This test assumes that the /put_number endpoint is NOT excluded by the middleware.
+    # The middleware in main.py currently does not exclude /put_number.
+    response = client.post("/put_number", json=large_payload_dict)
+    assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, response.text
+
+# --- File Upload Sanitization Tests ---
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_malicious_filename_path_traversal(client):
+    # Ensure the mock for os.path.join in mock_file_system_operations_fixture
+    # reflects the sanitized name if we want to assert the saved path.
+    # The current mock_file_system_operations_fixture uses a static "mock_saved_file.jpg".
+    # We might need a more dynamic mock or to inspect the 'image_data_to_create'
+    # that gets passed to crud.create_image. For now, let's focus on the filename in the DB.
+
+    malicious_filename = "../../../etc/passwd"
+    # Expected sanitized: "etc_passwd" or similar, depending on secure_filename
+    # from werkzeug.utils import secure_filename as werkzeug_secure_filename
+    # expected_sanitized_name_by_werkzeug = werkzeug_secure_filename(malicious_filename)
+    # print(f"Werkzeug sanitized: {expected_sanitized_name_by_werkzeug}") -> becomes "etc_passwd"
+
+    file_to_upload = create_dummy_file_for_upload(malicious_filename, MINIMAL_JPG_CONTENT, "image/jpeg")
+
+    response = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response.status_code == status.HTTP_201_CREATED, response.text
+    data = response.json()
+
+    # Check the filename stored in the response/DB (should be sanitized)
+    # The 'filename' field in ImageCreate is what we're interested in.
+    # secure_filename changes "../../../etc/passwd" to "etc_passwd"
+    assert data["filename"] == "etc_passwd", f"Filename was {data['filename']}, expected etc_passwd"
+
+    # Also ensure the server_filepath in the DB record (if accessible here) is safe
+    # The mock_file_system_operations_fixture currently returns a fixed path.
+    # To properly test this, we'd need to inspect the arguments to os.path.join
+    # or ensure the DB record has the sanitized name in its path.
+    db = SessionLocal()
+    try:
+        img_id = uuid.UUID(data["id"])
+        db_img = db.query(models.Image).filter(models.Image.id == img_id).first()
+        assert db_img is not None
+        assert db_img.filename == "etc_passwd" # Check DB record
+        # The filepath stored in DB should also use the sanitized name components.
+        # Our current UPLOAD_DIR + unique_hex + extension structure means the original
+        # malicious filename isn't directly part of the server path construction,
+        # only the final extension is taken from the original (sanitized) mime type.
+        # The `image_data_to_create.filename` is what gets saved in the DB model.
+        # The actual file path on server is `UPLOAD_DIR/uuid.hex.actual_extension`.
+        # So, the main check is that `db_img.filename` (which comes from `file.filename` after sanitization) is safe.
+    finally:
+        db.close()
+
+def test_upload_malicious_filename_script_tag(client):
+    malicious_filename = "<script>alert('evil')</script>.jpg"
+    # secure_filename changes this to "script_alert_evil_script.jpg"
+    expected_sanitized = "script_alert_evil_script.jpg"
+
+    file_to_upload = create_dummy_file_for_upload(malicious_filename, MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response.status_code == status.HTTP_201_CREATED, response.text
+    data = response.json()
+    assert data["filename"] == expected_sanitized
+
+
+# --- Pydantic Validation Tests for a Generic Endpoint (e.g., /put_number) ---
+def test_put_number_missing_value():
+    response = client.post("/put_number", json={}) # Missing 'value'
+    assert response.status_code == 422, response.text
+    data = response.json()
+    assert any(err["loc"] == ["body", "value"] and "Missing" in err["msg"] for err in data["detail"])
+
+def test_put_number_invalid_type():
+    response = client.post("/put_number", json={"value": "not-an-integer"})
+    assert response.status_code == 422, response.text
+    data = response.json()
+    assert any(err["loc"] == ["body", "value"] and "Input should be a valid integer" in err["msg"] for err in data["detail"])
+
+def test_put_number_out_of_range_negative():
+    # Assuming NumberCreate.value has conint(ge=0) from previous model updates
+    response = client.post("/put_number", json={"value": -10})
+    assert response.status_code == 422, response.text
+    data = response.json()
+    assert any(err["loc"] == ["body", "value"] and "greater than or equal to 0" in err["msg"] for err in data["detail"])
+
+
+# Malicious string inputs for a generic JSON field (e.g., ImageCreate.rejection_reason if it were settable via API)
+# For /put_number, the 'value' is an int, so not suitable for string attacks.
+# Let's consider the /api/images/upload endpoint and its string fields in ImageCreate,
+# although these are not directly set by user JSON but derived from file properties.
+# The `filename` is already tested for sanitization.
+# `mimetype`, `format`, `color_profile` are also string-based but derived.
+# The one place a user *might* inject strings that get stored is if an error message
+# from an external service (like Vision API mock) was directly put into `rejection_reason`.
+# However, our current `moderate_image_content` returns fixed strings or from `error.message`.
+# This test is more relevant for endpoints that take arbitrary user JSON with string fields.
+# For now, we'll skip direct SQLi/XSS tests on string fields in `test_main.py` as `upload_image`
+# doesn't take arbitrary JSON strings that are directly stored without sanitization of the field itself.
+# Filename sanitization is the key one for `upload_image`.
+
+
+# --- Advanced Rate Limiting Tests for Main Endpoints ---
+
+# 1. Differentiated Limits for /api/images/upload
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limiting_anonymous(client):
+    for i in range(ANON_REQUESTS_PER_WINDOW):
+        file_to_upload = create_dummy_file_for_upload(f"anon_upload_{i}.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        response = client.post("/api/images/upload", files={"file": file_to_upload})
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Anonymous upload attempt {i+1} rate limited prematurely.")
+        assert response.status_code == status.HTTP_201_CREATED # Assuming valid upload otherwise
+
+    # Next request should be rate limited
+    file_to_upload = create_dummy_file_for_upload("anon_upload_final.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == "0"
+
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limiting_authenticated(client, db_session): # Added db_session for user cleanup
+    token, user_email_for_cleanup = create_user_and_get_token(client, db_session, "upload_auth_rl")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        file_to_upload = create_dummy_file_for_upload(f"auth_upload_{i}.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        response = client.post("/api/images/upload", files={"file": file_to_upload}, headers=auth_headers)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Authenticated upload attempt {i+1} rate limited prematurely.")
+        assert response.status_code == status.HTTP_201_CREATED
+
+    # Next request should be rate limited
+    file_to_upload = create_dummy_file_for_upload("auth_upload_final.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload}, headers=auth_headers)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == "0"
+
+    # Cleanup created user
+    db = SessionLocal()
+    clear_user_from_db(db, user_email_for_cleanup) # Re-using clear_user_from_db from test_auth style
+    db.close()
+
+# 2. Rate Limit Headers for /api/images/upload
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limit_headers_anonymous_single_request(client):
+    file_to_upload = create_dummy_file_for_upload("header_test_anon.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response.status_code == status.HTTP_201_CREATED
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == str(ANON_REQUESTS_PER_WINDOW - 1)
+    assert headers["reset"] is not None
+    assert int(headers["reset"]) > time.time() - 5 # Reset time should be in the future (approx)
+
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limit_headers_authenticated_single_request(client, db_session):
+    token, user_email_for_cleanup = create_user_and_get_token(client, db_session, "upload_hdr_auth_rl")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    file_to_upload = create_dummy_file_for_upload("header_test_auth.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+
+    response = client.post("/api/images/upload", files={"file": file_to_upload}, headers=auth_headers)
+    assert response.status_code == status.HTTP_201_CREATED
+    headers = get_rate_limit_headers_from_response(response)
+    assert headers["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
+    assert headers["remaining"] == str(AUTH_REQUESTS_PER_WINDOW - 1)
+    assert headers["reset"] is not None
+    assert int(headers["reset"]) > time.time() - 5
+
+    db = SessionLocal()
+    clear_user_from_db(db, user_email_for_cleanup)
+    db.close()
+
+# 3. Rate Limit Reset Test (using /api/images/upload anonymous)
+@pytest.mark.usefixtures("mock_moderate_content_approve_fixture", "mock_file_system_operations_fixture")
+def test_upload_image_rate_limit_reset_anonymous(client):
+    # Exceed limit
+    for i in range(ANON_REQUESTS_PER_WINDOW + 1):
+        file_to_upload = create_dummy_file_for_upload(f"reset_anon_upload_{i}.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+        response = client.post("/api/images/upload", files={"file": file_to_upload})
+        if i == ANON_REQUESTS_PER_WINDOW:
+            assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            headers_429 = get_rate_limit_headers_from_response(response)
+            reset_time = int(headers_429["reset"])
+            current_time = int(time.time())
+            sleep_duration = max(0, reset_time - current_time) + 1
+            if sleep_duration > 65: # Safety for tests
+                pytest.skip(f"Reset time too far ({sleep_duration}s), skipping sleep.")
+            time.sleep(sleep_duration)
+
+    # Try again after waiting
+    file_to_upload = create_dummy_file_for_upload("reset_anon_upload_final.jpg", MINIMAL_JPG_CONTENT, "image/jpeg")
+    response_after_reset = client.post("/api/images/upload", files={"file": file_to_upload})
+    assert response_after_reset.status_code == status.HTTP_201_CREATED
+    headers_after = get_rate_limit_headers_from_response(response_after_reset)
+    assert headers_after["remaining"] == str(ANON_REQUESTS_PER_WINDOW - 1)
+
+
+# 4. Basic Rate Limit Test for other new endpoints in main.py
+# We'll test one from each group (analysis, enhancement) anonymously.
+# These require an image_id. We must upload an image first (un-rate-limited for setup).
+# For these, we mock less and let the actual DB interaction for image creation happen.
+
+@pytest.fixture(scope="function")
+def uploaded_image_id(client):
+    # This fixture uploads an image (bypassing rate limits on *this specific upload* if needed,
+    # or assuming it fits within limits for test setup) and returns its ID.
+    # For simplicity, we assume this setup upload won't hit a limit itself.
+    # To make it truly isolated, one might need to temporarily disable rate limiting for setup,
+    # or use a pre-existing image ID if the test environment allows.
+
+    # Temporarily remove rate limit from upload for this setup call
+    # This is a bit hacky. A better way might be to have a test utility that directly adds to DB
+    # or a specific "setup" endpoint without limits.
+    # For now, we'll just hope this one request doesn't get limited itself.
+    img_bytes = create_dummy_image_bytes(10,10) # Small image
+    file_data = ("setup_image.jpg", io.BytesIO(img_bytes), "image/jpeg")
+
+    # We need to ensure the moderation passes for the setup image.
+    with patch("main.moderate_image_content", return_value=ContentModerationResult(is_approved=True, rejection_reason=None)):
+        response = client.post("/api/images/upload", files={"file": file_data})
+
+    assert response.status_code == status.HTTP_201_CREATED, f"Setup image upload failed: {response.text}"
+    return response.json()["id"]
+
+
+def test_analysis_faces_endpoint_rate_limited_anon(client, uploaded_image_id):
+    endpoint_url = f"/api/analysis/faces/{uploaded_image_id}"
+    for i in range(ANON_REQUESTS_PER_WINDOW):
+        response = client.get(endpoint_url)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Anonymous request {i+1} to {endpoint_url} rate limited prematurely.")
+        # This endpoint might 404 if image processing fails or file not found by underlying service,
+        # but we are testing rate limiting primarily. A 200 or 404 is fine as long as not 429 yet.
+        assert response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+
+    response = client.get(endpoint_url)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+def test_enhancement_apply_endpoint_rate_limited_auth(client, uploaded_image_id, db_session):
+    token, user_email_for_cleanup = create_user_and_get_token(client, db_session, "enh_apply_rl")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    endpoint_url = "/api/enhancement/apply"
+    # Dummy params that should pass Pydantic validation for EnhancementRequest
+    enhancement_params = {
+        "brightness_target": 1.1, "contrast_target": 1.1, "saturation_target": 1.1,
+        "background_blur_radius": 0, "crop_rect": [0,0,10,10], "face_smooth_intensity": 0.0
+    }
+    request_body = {"image_id": uploaded_image_id, "parameters": enhancement_params}
+
+    for i in range(AUTH_REQUESTS_PER_WINDOW):
+        response = client.post(endpoint_url, json=request_body, headers=auth_headers)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            pytest.fail(f"Authenticated request {i+1} to {endpoint_url} rate limited prematurely.")
+        # Other status codes (e.g., 200 if processing works, or 500 if image file is missing for processing by this point)
+        # are acceptable as long as it's not 429 yet.
+        assert response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+
+    response = client.post(endpoint_url, json=request_body, headers=auth_headers)
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+    db = SessionLocal()
+    clear_user_from_db(db, user_email_for_cleanup)
+    db.close()
+
+
 @pytest.fixture
 def mock_file_system_operations_fixture(mocker):
     """Mocks file system operations like open, makedirs, path.join for uploads."""

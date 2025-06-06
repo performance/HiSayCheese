@@ -2,6 +2,7 @@
 import uuid
 import magic
 import os # Added os import
+from werkzeug.utils import secure_filename
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status # Added status
 import json # Added for EnhancementHistory
 from sqlalchemy.orm import Session
@@ -15,6 +16,22 @@ import io
 
 # JSONResponse is not strictly needed if returning Pydantic model with status_code
 # from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware # Import for CORS
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseCall
+from starlette.requests import Request
+from starlette.responses import Response as StarletteResponse # Renamed to avoid conflict with FastAPI's Response
+from starlette.types import ASGIApp # Added for middleware
+
+# Rate Limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.models import Limit # For parsing rate limit strings
+from slowapi.util import parse_many # To parse rate limit strings like "100/minute"
+
+from fastapi.responses import JSONResponse # For the exception handler
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+from config import SECRET_KEY, ALGORITHM # For decoding JWT
 
 from db.database import create_db_and_tables, get_db
 from db import crud
@@ -100,7 +117,235 @@ class ProcessedImageResponse(BaseModel):
     message: str
     error: Optional[str] = None
 
+
+# Maximum request body size (e.g., 1MB for general JSON, file uploads are separate)
+MAX_REQUEST_BODY_SIZE = 1 * 1024 * 1024  # 1MB
+
+# Middleware for adding security headers
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> Response:
+        response = await call_next(request)
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        # A starting point for CSP. Might need adjustment for specific frontend needs (CDNs, inline scripts, etc.)
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none';"
+        # HSTS: Only enable if ALWAYS served over HTTPS.
+        # Note: While this application sets the HSTS header, actual HTTPS enforcement (SSL termination,
+        # HTTP to HTTPS redirection) should be handled by a reverse proxy (e.g., Nginx, Traefik)
+        # or a cloud load balancer in a production environment.
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        return response
+
+class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: ASGIApp, max_size: int):
+        super().__init__(app)
+        self.max_size = max_size
+
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse:
+        # Skip size check for specific paths like file uploads if they handle streaming separately
+        # For example, if '/api/images/upload' handles large files directly.
+        # This example applies the limit to most other JSON-based endpoints.
+        if request.url.path == "/api/images/upload": # Assuming this is your upload endpoint
+             return await call_next(request)
+
+        # Check Content-Length header first
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_size:
+                    logger.warning(f"Request body size ({content_length} bytes) exceeds limit of {self.max_size} bytes for {request.url.path}.")
+                    return StarletteResponse(content="Request entity too large.", status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, media_type="text/plain")
+            except ValueError:
+                logger.warning(f"Invalid Content-Length header: {content_length}")
+                # Proceed to stream reading if content-length is invalid
+
+        body_chunks = []
+        received_size = 0
+        stream = request.stream()
+        async for chunk in stream:
+            received_size += len(chunk)
+            if received_size > self.max_size:
+                logger.warning(f"Request body stream exceeded limit of {self.max_size} bytes at {request.url.path}.")
+                return StarletteResponse(content="Request entity too large.", status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, media_type="text/plain")
+            body_chunks.append(chunk)
+
+        full_body = b"".join(body_chunks)
+
+        # Replace the request's receive channel with one that returns the buffered body
+        async def new_receive():
+            return {"type": "http.request", "body": full_body, "more_body": False}
+
+        request.scope['receive'] = new_receive
+
+        response = await call_next(request)
+        return response
+
+# Optional Bearer token scheme for rate limiter key function
+oauth2_scheme_optional = HTTPBearer(auto_error=False)
+
+# Define rate limit strings
+AUTH_USER_RATE_LIMIT = "100/minute"
+ANON_USER_RATE_LIMIT = "20/minute"
+
+# New key function for rate limiting (modified to add prefixes)
+# This is the corrected and single version of this function.
+def get_request_identifier_for_rate_limit(request: Request, creds: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme_optional)) -> str:
+    identifier_type = "ip" # To help with logging prefix
+    identifier = request.client.host
+    try:
+        if creds and creds.credentials:
+            token = creds.credentials
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("user_id")
+            if user_id:
+                identifier = str(user_id)
+                identifier_type = "user"
+                # logger.debug(f"Rate limiting by user_id: {identifier}") # Covered by prefix log
+            else:
+                sub = payload.get("sub")
+                if sub:
+                    identifier = str(sub)
+                    identifier_type = "sub"
+                    # logger.debug(f"Rate limiting by token subject (sub): {identifier}") # Covered by prefix log
+                else:
+                    logger.warning("Token present but no 'user_id' or 'sub' claim found. Falling back to IP.")
+            return f"{identifier_type}:{identifier}"
+    except JWTError as e:
+        logger.warning(f"JWTError during token decoding for rate limit key: {e}. Falling back to IP.")
+    except Exception as e:
+        logger.error(f"Unexpected error in get_request_identifier_for_rate_limit: {e}. Falling back to IP.")
+
+    # Fallback to IP if token processing failed or no token
+    key = f"ip:{request.client.host}"
+    request.state.rate_limit_key = key # Store for header middleware
+    logger.debug(f"Rate limiting by {key} for request to {request.url.path}")
+    return key
+
+
+# Function to get dynamic rate limit based on key prefix
+def get_dynamic_rate_limit(key: str) -> str:
+    if key.startswith("user:") or key.startswith("sub:"):
+        logger.debug(f"Applying authenticated user rate limit for key: {key}")
+        return AUTH_USER_RATE_LIMIT
+    else: # Starts with "ip:" or is an unexpected format (default to anon)
+        if not key.startswith("ip:"):
+            logger.warning(f"Unexpected key format '{key}' for dynamic rate limit, applying anonymous limit.")
+        logger.debug(f"Applying anonymous user rate limit for key: {key}")
+        return ANON_USER_RATE_LIMIT
+
+# Initialize Limiter with the new key function
+limiter = Limiter(key_func=get_request_identifier_for_rate_limit)
+
+# Middleware for adding X-RateLimit headers
+class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse:
+        response = await call_next(request)
+
+        key = getattr(request.state, 'rate_limit_key', None)
+
+        # Only add headers if the key was set (meaning a rate-limited route was hit)
+        # And if the app.state.limiter is available (it should be)
+        if key and hasattr(request.app.state, 'limiter'):
+            try:
+                limiter_instance: Limiter = request.app.state.limiter
+
+                # Determine the rate limit string dynamically for this key
+                # This assumes that get_dynamic_rate_limit is accessible here.
+                # It's defined globally in main.py, so it should be.
+                rate_string = get_dynamic_rate_limit(key)
+
+                # Parse the rate string to a Limit object (actually a list of them)
+                # We'll use the first one, assuming simple limits like "100/minute"
+                current_limit_obj_list = parse_many(rate_string)
+                if not current_limit_obj_list:
+                    logger.error(f"Could not parse rate string: {rate_string} for key {key}")
+                    return response
+
+                current_limit_obj: Limit = current_limit_obj_list[0]
+
+                # Get window stats
+                # get_window_stats expects a slowapi.models.Limit object, not just the string.
+                window_stats = limiter_instance.storage.get_window_stats(key, current_limit_obj)
+
+                reset_time = int(window_stats[0])
+                remaining_count = window_stats[1]
+                limit_amount = current_limit_obj.amount
+
+                response.headers["X-RateLimit-Limit"] = str(limit_amount)
+                response.headers["X-RateLimit-Remaining"] = str(remaining_count)
+                response.headers["X-RateLimit-Reset"] = str(reset_time)
+                logger.debug(f"Added rate limit headers for key {key}: Limit={limit_amount}, Remaining={remaining_count}, Reset={reset_time}")
+
+            except Exception as e:
+                logger.error(f"Error adding rate limit headers: {e}", exc_info=True)
+
+        return response
+
+# Custom RateLimitExceeded handler to add headers
+async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    """
+    Custom handler for RateLimitExceeded to add X-RateLimit headers.
+    """
+    response = JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": f"Rate limit exceeded: {exc.detail}"}
+    )
+
+    try:
+        key = exc.key if hasattr(exc, 'key') else getattr(request.state, 'rate_limit_key', None)
+        limit_obj = exc.limit if hasattr(exc, 'limit') else None
+
+        if key and limit_obj and hasattr(request.app.state, 'limiter'):
+            limiter_instance: Limiter = request.app.state.limiter
+            window_stats = limiter_instance.storage.get_window_stats(key, limit_obj) # exc.limit should be a Limit object
+
+            reset_time = int(window_stats[0])
+            # Remaining is 0 because the limit was exceeded
+
+            response.headers["X-RateLimit-Limit"] = str(limit_obj.amount)
+            response.headers["X-RateLimit-Remaining"] = "0"
+            response.headers["X-RateLimit-Reset"] = str(reset_time)
+            logger.debug(f"Added rate limit headers to 429 response for key {key}")
+        else:
+            logger.warning(f"Could not add rate limit headers to 429: key or limit_obj missing. Key from state: {key}, exc.limit: {limit_obj}")
+
+    except Exception as e:
+        logger.error(f"Error in custom_rate_limit_exceeded_handler adding headers: {e}", exc_info=True)
+
+    return response
+
+
 app = FastAPI()
+
+# Add Rate Limiter state and exception handler (custom one now)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
+
+
+# Add middlewares to the application
+# CORS should typically be one of the first, if not the first.
+# However, if other middlewares might modify requests in ways that CORS should see,
+# or if CORS needs to act before them, adjust order.
+# For typical setup, CORS first is common.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Placeholder: Should be restricted in production via env var
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all standard methods
+    allow_headers=["*"], # Allows all headers
+)
+
+# SecurityHeadersMiddleware should ideally be one of the first
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)
+# RateLimitHeaderMiddleware should be added after slowapi might have interacted (though it doesn't use middleware)
+# and after request.state.rate_limit_key is potentially set.
+# It should be one of the later middlewares so it can modify the final response.
+app.add_middleware(RateLimitHeaderMiddleware)
+
+
+# It's important that routers are included AFTER the limiter is set on app.state
+# and exception handlers are added.
 app.include_router(auth_router.router) # Include the auth router
 app.include_router(users_router.router) # Include the users router
 
@@ -117,8 +362,9 @@ MIME_TYPE_TO_EXTENSION = {
     "image/png": ".png",
     "image/webp": ".webp",
 }
-MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE_MB = 15 # Max for image files (handled by endpoint)
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+# MAX_REQUEST_BODY_SIZE is defined above for general requests
 
 @app.on_event("startup")
 def on_startup():
@@ -263,7 +509,8 @@ async def moderate_image_content(contents: bytes) -> ContentModerationResult:
 
 # Updated image upload endpoint
 @app.post("/api/images/upload", response_model=models.ImageSchema, status_code=status.HTTP_201_CREATED)
-async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_db)):
+@limiter.limit(get_dynamic_rate_limit)
+async def upload_image(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
     contents = await file.read()
     file_size = len(contents)
 
@@ -312,6 +559,11 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
     # Let's adjust to create ImageCreate with moderation result first.
     # os.makedirs(UPLOAD_DIR, exist_ok=True) # Moved down
 
+    # Sanitize the filename before using it
+    sanitized_filename = secure_filename(file.filename)
+    if not sanitized_filename: # Handle cases where filename might be empty or only contain invalid chars
+        sanitized_filename = f"upload_{uuid.uuid4().hex}" # Fallback filename
+
     # Initial ImageCreate data, filepath might be updated if approved
     # Extract metadata using Pillow
     img_width, img_height, img_format, exif_orientation, color_profile = None, None, None, None, None
@@ -337,7 +589,7 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
         # For now, proceed with None, as these fields are optional
 
     image_data_to_create = models.ImageCreate(
-        filename=file.filename,
+        filename=sanitized_filename, # Use sanitized filename
         filepath=None, # Default to None, set if image is approved and saved
         filesize=file_size,
         mimetype=actual_content_type,
@@ -350,7 +602,7 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
     )
 
     if not moderation_result.is_approved:
-        logger.info(f"Image rejected: {moderation_result.rejection_reason}. Original filename: {file.filename}")
+        logger.info(f"Image rejected: {moderation_result.rejection_reason}. Original filename: {file.filename}, Sanitized: {sanitized_filename}")
         # Save metadata for rejected image, filepath is None as file is not saved.
         db_image = crud.create_image(
             db=db,
@@ -406,7 +658,8 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
 
 # Endpoint for Face Detection
 @app.get("/api/analysis/faces/{image_id}", response_model=FaceDetectionResponse)
-async def get_face_detections(image_id: uuid.UUID, db: Session = Depends(get_db)): # Changed image_id type to uuid.UUID
+@limiter.limit(get_dynamic_rate_limit)
+async def get_face_detections(request: Request, image_id: uuid.UUID, db: Session = Depends(get_db)): # Changed image_id type to uuid.UUID
     db_image = crud.get_image(db, image_id=image_id) # crud.get_image should handle UUID
     if not db_image:
         logger.warning(f"Face detection request for non-existent image_id: {image_id}")
@@ -446,7 +699,8 @@ async def get_face_detections(image_id: uuid.UUID, db: Session = Depends(get_db)
 
 
 @app.get("/api/analysis/quality/{image_id}", response_model=ImageQualityAnalysisResponse)
-async def get_image_quality_analysis(image_id: uuid.UUID, db: Session = Depends(get_db)):
+@limiter.limit(get_dynamic_rate_limit)
+async def get_image_quality_analysis(request: Request, image_id: uuid.UUID, db: Session = Depends(get_db)):
     db_image = crud.get_image(db, image_id=image_id)
     if not db_image:
         logger.warning(f"Image quality analysis request for non-existent image_id: {image_id}")
@@ -490,7 +744,9 @@ async def get_image_quality_analysis(image_id: uuid.UUID, db: Session = Depends(
 
 
 @app.get("/api/enhancement/auto/{image_id}", response_model=AutoEnhancementResponse)
+@limiter.limit(get_dynamic_rate_limit)
 async def get_auto_enhancement_parameters(
+    request: Request,
     image_id: uuid.UUID,
     mode: Optional[str] = None, # Allows for different enhancement modes e.g. "passport"
     db: Session = Depends(get_db)
@@ -572,8 +828,12 @@ async def get_auto_enhancement_parameters(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate auto enhancement parameters due to an internal error.")
 
 @app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
+@limiter.limit(get_dynamic_rate_limit)
 async def apply_image_enhancements_endpoint(
-    request: ImageEnhancementRequest,
+    # The 'request: Request' parameter for FastAPI/Starlette must come before `request: ImageEnhancementRequest` (Pydantic model)
+    # So, we rename one of them. Let's rename the FastAPI/Starlette request.
+    http_request: Request, # Renamed to avoid conflict with Pydantic model 'request'
+    request: ImageEnhancementRequest, # This is the Pydantic model for the request body
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user) # Added current_user
 ):
@@ -737,9 +997,11 @@ async def apply_image_enhancements_endpoint(
 
 
 @app.post("/api/enhancement/apply-preset/{preset_id}", response_model=ProcessedImageResponse)
+@limiter.limit(get_dynamic_rate_limit)
 async def apply_preset_to_image_endpoint(
+    http_request: Request, # Renamed to avoid conflict
     preset_id: uuid.UUID,
-    request_data: ApplyPresetRequest,
+    request_data: ApplyPresetRequest, # This is the Pydantic model for the request body
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):

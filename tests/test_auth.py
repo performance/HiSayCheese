@@ -127,9 +127,158 @@ def test_register_user_weak_password():
         json={"email": f"test_weak_pw_{uuid.uuid4()}@example.com", "password": "pw"},
     )
 
+    assert response.status_code == 422, response.text # Should be 422 due to Pydantic validation
+    data = response.json()
+    # Check for Pydantic's specific error structure
+    assert any(err["msg"] for err in data["detail"] if "password" in err["loc"])
+
+
+# Password Strength Tests (now handled by Pydantic model)
+@pytest.mark.parametrize(
+    "password, expected_msg_part",
+    [
+        ("short", "8 characters"), # Too short
+        ("nouppercase1!", "uppercase letter"),
+        ("NOUPPERCASE1!", "uppercase letter"), # Edge case if regex is only [a-z]
+        ("NOLOWERCASE1!", "lowercase letter"),
+        ("NoLoWeRcAsE!", "digit"),
+        ("NoLoWeRcAsE1", "special character"),
+    ],
+)
+def test_register_user_password_strength_violations(password, expected_msg_part):
+    unique_email = f"test_pw_strength_{uuid.uuid4()}@example.com"
+    response = client.post(
+        "/api/auth/register",
+        json={"email": unique_email, "password": password},
+    )
     assert response.status_code == 422, response.text
     data = response.json()
-    assert data["detail"] == "Password must be at least 8 characters long."
+    assert isinstance(data["detail"], list)
+    password_errors = [err for err in data["detail"] if err.get("loc") == ["body", "password"]]
+    assert len(password_errors) > 0, "No Pydantic error found for password field"
+    # The actual message comes from Pydantic (constr) or our custom validator's ValueError.
+    # Pydantic wraps ValueError from custom validators.
+    found_match = False
+    for err in password_errors:
+        if "ctx" in err and "error" in err["ctx"]: # Custom validator's ValueError
+             if expected_msg_part in str(err["ctx"]["error"]): # Convert error to string to search
+                found_match = True
+                break
+        elif expected_msg_part in err["msg"]: # Standard Pydantic error message
+            found_match = True
+            break
+    assert found_match, f"Expected message part '{expected_msg_part}' not found in password errors: {password_errors}"
+
+
+# Test for missing parameters (Pydantic validation)
+def test_register_user_missing_email():
+    response = client.post(
+        "/api/auth/register",
+        json={"password": "ValidPassword1!"},
+    )
+    assert response.status_code == 422, response.text
+    data = response.json()
+    assert any(err["loc"] == ["body", "email"] and "Missing" in err["msg"] for err in data["detail"])
+
+def test_register_user_missing_password():
+    response = client.post(
+        "/api/auth/register",
+        json={"email": "testmissing@example.com"},
+    )
+    assert response.status_code == 422, response.text
+    data = response.json()
+    assert any(err["loc"] == ["body", "password"] and "Missing" in err["msg"] for err in data["detail"])
+
+
+# Test for malicious string inputs (SQLi/XSS attempts)
+@pytest.mark.parametrize(
+    "malicious_input",
+    [
+        "' OR '1'='1",
+        "<script>alert('XSS')</script>",
+        "../../../../../etc/passwd%00", # Path traversal attempt with null byte
+    ]
+)
+def test_register_user_malicious_email_string(malicious_input):
+    # Email field has specific validation (EmailStr), so these might be caught by format validation
+    # or by Pydantic's general string processing.
+    response = client.post(
+        "/api/auth/register",
+        json={"email": malicious_input, "password": "ValidPassword1!"},
+    )
+    assert response.status_code == 422 # Expect Pydantic validation error for email format
+    data = response.json()
+    assert any(err["loc"] == ["body", "email"] for err in data["detail"])
+
+# Malicious password test - password is not typically stored as-is or reflected,
+# but good to check it doesn't break input processing.
+# Password validation rules are more about complexity.
+def test_register_user_malicious_password_string():
+    # This should be caught by password strength validation if it doesn't meet criteria.
+    # If it *does* meet criteria, it should be accepted and hashed.
+    # The main concern is that it doesn't cause an error during processing *before* hashing.
+    malicious_password_thats_also_strong = "<script>alert('XSS')</script>A1!"
+    email = f"test_malicious_pw_{uuid.uuid4()}@example.com"
+    response = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": malicious_password_thats_also_strong},
+    )
+    # If the malicious password meets strength criteria, it should be accepted (201)
+    # Pydantic's `constr` doesn't inherently sanitize against XSS for passwords,
+    # as they are not meant to be displayed. Hashing is the security measure.
+    # Our custom validator also doesn't sanitize, it checks for character types.
+    assert response.status_code == 201, response.text
+    # Cleanup if created
+    if response.status_code == 201:
+        db = SessionLocal()
+        clear_user_from_db(db, email)
+        db.close()
+
+# Rate Limiting Tests
+def test_register_rate_limiting():
+    email_prefix = f"ratelimit_reg_{uuid.uuid4()}"
+    password = "ValidPassword1!"
+    # Default limit for /register is "5/minute"
+    for i in range(5): # Make 5 successful requests
+        response = client.post("/api/auth/register", json={"email": f"{email_prefix}_{i}@example.com", "password": password})
+        if response.status_code == 201: # If successful, clean up
+            db = SessionLocal()
+            clear_user_from_db(db, f"{email_prefix}_{i}@example.com")
+            db.close()
+        else: # If one of the first 5 fails unexpectedly (e.g. DB issue), fail the test
+            pytest.fail(f"Registration attempt {i+1} failed: {response.text}")
+
+    # The 6th request should be rate-limited
+    response = client.post("/api/auth/register", json={"email": f"{email_prefix}_6@example.com", "password": password})
+    assert response.status_code == 429, response.text
+    assert "Rate limit exceeded" in response.json()["detail"]
+
+
+def test_login_rate_limiting(db_session: Session):
+    user_email = f"ratelimit_login_{uuid.uuid4()}@example.com"
+    user_password = "ValidPassword1!"
+
+    # Register user
+    reg_response = client.post("/api/auth/register", json={"email": user_email, "password": user_password})
+    assert reg_response.status_code == 201, f"Registration for rate limit test failed: {reg_response.text}"
+
+    # Default limit for /login is "10/minute"
+    for i in range(10):
+        response = client.post("/api/auth/login", data={"username": user_email, "password": user_password})
+        # Don't check for 200 here, as we are just hitting the endpoint.
+        # It might be 401 if something is wrong, but we are testing rate limiter.
+        # However, for a clean test, ensure it would be 200 if not for rate limit.
+        if response.status_code == 429: # If rate limited early, test setup is wrong or limit too low
+             pytest.fail(f"Login attempt {i+1} was rate limited prematurely: {response.text}")
+
+
+    # The 11th request should be rate-limited
+    response = client.post("/api/auth/login", data={"username": user_email, "password": user_password})
+    assert response.status_code == 429, response.text
+    assert "Rate limit exceeded" in response.json()["detail"]
+
+    # Cleanup
+    clear_user_from_db(db_session, user_email)
 
 
 # Tests for /api/auth/login

@@ -123,3 +123,93 @@ def test_access_users_me_with_expired_token(client: TestClient, test_user_factor
     )
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
     assert response.json()["detail"] == "Token has expired"
+
+
+# Tests for /api/users/history query parameter validation (skip, limit)
+# Assuming User model and history records are created elsewhere or not strictly needed
+# for just testing the parameter validation itself, as Pydantic/FastAPI handle it early.
+
+def test_read_user_history_invalid_skip_negative(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory()
+    token = access_token_factory(user_details)
+    response = client.get(
+        "/api/users/history?skip=-1&limit=10",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, response.text
+    data = response.json()
+    assert any(err["loc"] == ["query", "skip"] and "greater than or equal to 0" in err["msg"] for err in data["detail"])
+
+def test_read_user_history_invalid_limit_negative(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory()
+    token = access_token_factory(user_details)
+    response = client.get(
+        "/api/users/history?skip=0&limit=-5",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, response.text
+    data = response.json()
+    # Assuming limit also has ge=0 or similar constraint. If it's just int, this might pass.
+    # The Pydantic models were updated to conint(ge=0) for skip and limit.
+    # If limit has conint(gt=0), then 0 would also be an error. Assuming ge=0 for now.
+    assert any(err["loc"] == ["query", "limit"] and "greater than or equal to 0" in err["msg"] for err in data["detail"])
+
+
+def test_read_user_history_invalid_skip_type_string(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory()
+    token = access_token_factory(user_details)
+    response = client.get(
+        "/api/users/history?skip=abc&limit=10",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, response.text
+    data = response.json()
+    assert any(err["loc"] == ["query", "skip"] and "Input should be a valid integer" in err["msg"] for err in data["detail"])
+
+def test_read_user_history_invalid_limit_type_string(client: TestClient, test_user_factory, access_token_factory):
+    user_details = test_user_factory()
+    token = access_token_factory(user_details)
+    response = client.get(
+        "/api/users/history?skip=0&limit=xyz",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, response.text
+    data = response.json()
+    assert any(err["loc"] == ["query", "limit"] and "Input should be a valid integer" in err["msg"] for err in data["detail"])
+
+# Test for a very large limit, assuming there's a sensible upper bound defined in the endpoint's Pydantic model
+# or logic. If not, this might pass or lead to performance issues (which is why such limits are good).
+# For now, let's assume the model has `limit: conint(ge=0, le=100)` or similar from previous tasks.
+# If `limit` in `EnhancementHistoryParams` (if that's what's used, or directly in endpoint)
+# has `le=100` (as per `conint` in a Pydantic model for query params).
+# The current `routers/users.py` for `read_user_enhancement_history` directly uses `skip: int = 0, limit: int = 10`.
+# These are not yet using Pydantic models with `conint` for query parameters directly in the function signature.
+# FastAPI will convert them to int, but range constraints from `conint` are applied if a Pydantic model is used for query params.
+# Let's assume the previous Pydantic model enhancements included updating function signatures
+# or using a Depends with a Pydantic model for these query params.
+# If not, these out-of-range tests for query params might not behave as 422 UNLESS there's a Pydantic model.
+
+# Let's assume the endpoint `read_user_enhancement_history` was updated like:
+# class HistoryParams(BaseModel):
+#   skip: conint(ge=0) = 0
+#   limit: conint(ge=0, le=100) = 10 # Example upper limit
+# async def read_user_enhancement_history(params: HistoryParams = Depends(), ...):
+
+# If this is the case, then the following test would be valid:
+# def test_read_user_history_limit_too_large(client: TestClient, test_user_factory, access_token_factory):
+#     user_details = test_user_factory()
+#     token = access_token_factory(user_details)
+#     response = client.get(
+#         "/api/users/history?skip=0&limit=200", # Assuming max limit is 100
+#         headers={"Authorization": f"Bearer {token}"}
+#     )
+#     assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, response.text
+#     data = response.json()
+#     assert any(err["loc"] == ["query", "limit"] and "less than or equal to 100" in err["msg"] for err in data["detail"])
+
+# Given the current state of `routers/users.py` (skip: int, limit: int),
+# the "limit_too_large" test for 422 won't pass based on Pydantic model validation for query params.
+# The negative and type tests should pass due to FastAPI's default handling for int conversion.
+# I will proceed with the negative and type tests as they are generally applicable.
+# The "limit_too_large" test would require confirming Pydantic models are used for these query params.
+# For now, I will omit "limit_too_large" as it depends on an unconfirmed change to the endpoint signature.

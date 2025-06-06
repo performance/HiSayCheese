@@ -1,13 +1,20 @@
 import uuid
 from datetime import datetime
 from typing import Optional
+import re
 
 from sqlalchemy import Column, DateTime, Integer, String, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, conint, constr, validator
 
 Base = declarative_base()
+
+# Constants for validation
+MAX_STRING_LENGTH = 255
+MAX_FILE_SIZE_MB = 100  # Example: 100MB
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MIN_PASSWORD_LENGTH = 8
 
 class Number(Base):
     __tablename__ = "numbers"
@@ -46,7 +53,19 @@ class UserBase(BaseModel):
     email: EmailStr
 
 class UserCreate(UserBase):
-    password: str # min_length=8 will be handled by endpoint logic
+    password: constr(min_length=MIN_PASSWORD_LENGTH)
+
+    @validator('password')
+    def password_strength(cls, v):
+        if not re.search(r"[A-Z]", v):
+            raise ValueError('Password must contain an uppercase letter')
+        if not re.search(r"[a-z]", v):
+            raise ValueError('Password must contain a lowercase letter')
+        if not re.search(r"\d", v):
+            raise ValueError('Password must contain a digit')
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", v):
+            raise ValueError('Password must contain a special character')
+        return v
 
 class UserSchema(UserBase):
     id: uuid.UUID
@@ -71,15 +90,15 @@ class UserPreset(Base):
 
 # Pydantic schemas for UserPreset
 class PresetBase(BaseModel):
-    preset_name: str
-    parameters_json: str
+    preset_name: constr(max_length=MAX_STRING_LENGTH)
+    parameters_json: constr(max_length=2048) # Assuming JSON strings can be longer
 
 class PresetCreate(PresetBase):
     pass
 
 class PresetUpdate(PresetBase):
-    preset_name: Optional[str] = None
-    parameters_json: Optional[str] = None
+    preset_name: Optional[constr(max_length=MAX_STRING_LENGTH)] = None
+    parameters_json: Optional[constr(max_length=2048)] = None
 
 class PresetSchema(PresetBase):
     id: uuid.UUID
@@ -106,7 +125,7 @@ class EnhancementHistoryBase(BaseModel):
     user_id: uuid.UUID
     original_image_id: uuid.UUID
     processed_image_id: Optional[uuid.UUID] = None
-    parameters_json: str
+    parameters_json: constr(max_length=2048) # Assuming JSON strings can be longer
 
 class EnhancementHistorySchema(EnhancementHistoryBase):
     id: uuid.UUID
@@ -117,7 +136,7 @@ class EnhancementHistorySchema(EnhancementHistoryBase):
 
 
 class NumberBase(BaseModel):
-    value: int
+    value: conint(ge=0) # Example: ensure value is non-negative
 
 class NumberCreate(NumberBase):
     pass
@@ -130,27 +149,22 @@ class NumberSchema(NumberBase):
 
 # Pydantic schema for creating an Image
 class ImageCreate(BaseModel):
-    filename: str
-    filepath: Optional[str] = None
-    filesize: int
-    mimetype: str
-    width: Optional[int] = None
-    height: Optional[int] = None
-    format: Optional[str] = None
-    exif_orientation: Optional[int] = None
-    color_profile: Optional[str] = None
-    rejection_reason: Optional[str] = None
+    filename: constr(max_length=MAX_STRING_LENGTH)
+    filepath: Optional[constr(max_length=MAX_STRING_LENGTH * 2)] = None # Filepaths can be longer
+    filesize: conint(gt=0, le=MAX_FILE_SIZE_BYTES)
+    mimetype: constr(max_length=MAX_STRING_LENGTH)
+    width: Optional[conint(gt=0)] = None
+    height: Optional[conint(gt=0)] = None
+    format: Optional[constr(max_length=50)] = None
+    exif_orientation: Optional[conint(ge=1, le=8)] = None # EXIF orientation is typically 1-8
+    color_profile: Optional[constr(max_length=MAX_STRING_LENGTH)] = None
+    rejection_reason: Optional[constr(max_length=MAX_STRING_LENGTH * 2)] = None # Rejection reasons can be longer
 
 # Pydantic schema for reading/returning an Image
 class ImageSchema(ImageCreate): # Inherits fields from ImageCreate
     id: uuid.UUID
     created_at: datetime
-    width: Optional[int] = None
-    height: Optional[int] = None
-    format: Optional[str] = None
-    exif_orientation: Optional[int] = None
-    color_profile: Optional[str] = None
-    rejection_reason: Optional[str] = None
+    # width, height, format, etc. inherit constraints from ImageCreate via inheritance
 
     class Config:
         orm_mode = True

@@ -2,6 +2,7 @@
 import uuid
 import magic
 import os # Added os import
+from werkzeug.utils import secure_filename
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status # Added status
 import json # Added for EnhancementHistory
 from sqlalchemy.orm import Session
@@ -15,6 +16,16 @@ import io
 
 # JSONResponse is not strictly needed if returning Pydantic model with status_code
 # from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseCall
+from starlette.requests import Request
+from starlette.responses import Response as StarletteResponse # Renamed to avoid conflict with FastAPI's Response
+from starlette.types import ASGIApp # Added for middleware
+
+# Rate Limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse # For the exception handler
 
 from db.database import create_db_and_tables, get_db
 from db import crud
@@ -100,7 +111,84 @@ class ProcessedImageResponse(BaseModel):
     message: str
     error: Optional[str] = None
 
+
+# Maximum request body size (e.g., 1MB for general JSON, file uploads are separate)
+MAX_REQUEST_BODY_SIZE = 1 * 1024 * 1024  # 1MB
+
+# Middleware for adding security headers
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> Response:
+        response = await call_next(request)
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        # A starting point for CSP. Might need adjustment for specific frontend needs (CDNs, inline scripts, etc.)
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none';"
+        # HSTS: Only enable if ALWAYS served over HTTPS
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        return response
+
+class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: ASGIApp, max_size: int):
+        super().__init__(app)
+        self.max_size = max_size
+
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse:
+        # Skip size check for specific paths like file uploads if they handle streaming separately
+        # For example, if '/api/images/upload' handles large files directly.
+        # This example applies the limit to most other JSON-based endpoints.
+        if request.url.path == "/api/images/upload": # Assuming this is your upload endpoint
+             return await call_next(request)
+
+        # Check Content-Length header first
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_size:
+                    logger.warning(f"Request body size ({content_length} bytes) exceeds limit of {self.max_size} bytes for {request.url.path}.")
+                    return StarletteResponse(content="Request entity too large.", status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, media_type="text/plain")
+            except ValueError:
+                logger.warning(f"Invalid Content-Length header: {content_length}")
+                # Proceed to stream reading if content-length is invalid
+
+        body_chunks = []
+        received_size = 0
+        stream = request.stream()
+        async for chunk in stream:
+            received_size += len(chunk)
+            if received_size > self.max_size:
+                logger.warning(f"Request body stream exceeded limit of {self.max_size} bytes at {request.url.path}.")
+                return StarletteResponse(content="Request entity too large.", status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, media_type="text/plain")
+            body_chunks.append(chunk)
+
+        full_body = b"".join(body_chunks)
+
+        # Replace the request's receive channel with one that returns the buffered body
+        async def new_receive():
+            return {"type": "http.request", "body": full_body, "more_body": False}
+
+        request.scope['receive'] = new_receive
+
+        response = await call_next(request)
+        return response
+
+# Initialize Limiter
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI()
+
+# Add Rate Limiter state and exception handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# Add middlewares to the application
+# SecurityHeadersMiddleware should ideally be one of the first
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)
+
+# It's important that routers are included AFTER the limiter is set on app.state
+# and exception handlers are added, if the decorators need to access app.state.limiter via request.
+# However, for slowapi, the limiter instance is typically imported directly into the router files.
 app.include_router(auth_router.router) # Include the auth router
 app.include_router(users_router.router) # Include the users router
 
@@ -117,8 +205,9 @@ MIME_TYPE_TO_EXTENSION = {
     "image/png": ".png",
     "image/webp": ".webp",
 }
-MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE_MB = 15 # Max for image files (handled by endpoint)
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+# MAX_REQUEST_BODY_SIZE is defined above for general requests
 
 @app.on_event("startup")
 def on_startup():
@@ -312,6 +401,11 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
     # Let's adjust to create ImageCreate with moderation result first.
     # os.makedirs(UPLOAD_DIR, exist_ok=True) # Moved down
 
+    # Sanitize the filename before using it
+    sanitized_filename = secure_filename(file.filename)
+    if not sanitized_filename: # Handle cases where filename might be empty or only contain invalid chars
+        sanitized_filename = f"upload_{uuid.uuid4().hex}" # Fallback filename
+
     # Initial ImageCreate data, filepath might be updated if approved
     # Extract metadata using Pillow
     img_width, img_height, img_format, exif_orientation, color_profile = None, None, None, None, None
@@ -337,7 +431,7 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
         # For now, proceed with None, as these fields are optional
 
     image_data_to_create = models.ImageCreate(
-        filename=file.filename,
+        filename=sanitized_filename, # Use sanitized filename
         filepath=None, # Default to None, set if image is approved and saved
         filesize=file_size,
         mimetype=actual_content_type,
@@ -350,7 +444,7 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
     )
 
     if not moderation_result.is_approved:
-        logger.info(f"Image rejected: {moderation_result.rejection_reason}. Original filename: {file.filename}")
+        logger.info(f"Image rejected: {moderation_result.rejection_reason}. Original filename: {file.filename}, Sanitized: {sanitized_filename}")
         # Save metadata for rejected image, filepath is None as file is not saved.
         db_image = crud.create_image(
             db=db,

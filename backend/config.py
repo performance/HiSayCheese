@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+MODE = os.getenv("MODE", "development")  # default to dev
+
+
 # IMPORTANT: This is a default secret key for development purposes ONLY.
 # For production, use a strong, randomly generated key and load it from
 # an environment variable or a secure configuration management system.
@@ -39,6 +42,9 @@ def validate_configuration():
     default placeholder values.
     Raises ValueError if any critical variable is a placeholder.
     """
+    if MODE == "development":
+        print("[INFO] Skipping config validation in development mode.")
+        return
     critical_vars_and_placeholders = {
         "SECRET_KEY": "your-super-secret-key-please-change-in-production",
         "AWS_S3_BUCKET_NAME": "your-s3-bucket-name",

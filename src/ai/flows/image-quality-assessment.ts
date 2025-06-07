@@ -57,8 +57,8 @@ const prompt = ai.definePrompt({
 6.  **Expression Appropriateness**: Is the subject's expression suitable for a professional context (e.g., genuine, neutral, engaging)?
 7.  **Head-to-Body Ratio/Framing**: Is the subject well-framed (typically head and shoulders) and centered?
 8.  **Obstructions**: Are there any items obstructing the face (sunglasses, hats, hair, etc.)? (0=no obstructions, 10=highly obstructed - lower score is better).
-9.  **Portrait Suitability**: Is the image primarily a portrait with a prominent face suitable for a headshot? Consider if a face is present, its size relative to the image, and if it's the main subject. Provide `isLikelyPortrait` (boolean) and `portraitCriteriaFeedback` (string, optional).
-10. **Prohibited Content Check**: Does the image appear to contain any prohibited content (e.g., explicit nudity, graphic violence, hate symbols)? Provide `hasProhibitedContent` (boolean) and `prohibitedContentFeedback` (string, optional).
+9.  **Portrait Suitability**: Is the image primarily a portrait with a prominent face suitable for a headshot? Consider if a face is present, its size relative to the image, and if it's the main subject. Provide \`isLikelyPortrait\` (boolean) and \`portraitCriteriaFeedback\` (string, optional).
+10. **Prohibited Content Check**: Does the image appear to contain any prohibited content (e.g., explicit nudity, graphic violence, hate symbols)? Provide \`hasProhibitedContent\` (boolean) and \`prohibitedContentFeedback\` (string, optional).
 11. **Overall Suitability**: Based on all above, provide an overall suitability score.
 
 Provide specific feedback points as an array of strings for each criterion, especially for scores that are not perfect. Ensure your feedback also covers portrait suitability and any prohibited content.

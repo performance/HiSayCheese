@@ -1,3 +1,4 @@
+-r requirements.txt
 pytest
 httpx
 boto3>=1.20.0 # Or a version compatible with your moto version

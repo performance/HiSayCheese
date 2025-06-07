@@ -45,3 +45,25 @@ public/_auth/*
 firebase.json
 firebase-debug.log
 firestore-debug.log
+
+# Python specific
+*.pyc
+*.pyo
+__pycache__/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE & Editor specific - keeping settings.json
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Databases
+sql_app.db
+
+# Log files
+*.log

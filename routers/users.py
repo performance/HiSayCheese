@@ -7,7 +7,7 @@ from models.models import User, UserSchema, EnhancementHistorySchema, PresetCrea
 from auth_utils import get_current_user
 from db import crud
 from db.database import get_db # Added get_db
-from ..main import limiter, get_dynamic_rate_limit # Import rate limiter components
+from rate_limiter import limiter, get_dynamic_rate_limit # Changed from ..main to rate_limiter
 
 
 router = APIRouter(

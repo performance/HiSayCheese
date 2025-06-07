@@ -22,3 +22,6 @@ AWS_SES_SENDER_EMAIL: str = os.getenv("AWS_SES_SENDER_EMAIL", "sender@example.co
 
 # Frontend URL (for email links)
 FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+# Sentry Configuration
+SENTRY_DSN: str = os.getenv("SENTRY_DSN", "your-sentry-dsn-goes-here") # Placeholder DSN

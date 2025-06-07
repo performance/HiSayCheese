@@ -13,7 +13,7 @@ from typing import List, Optional
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import app, UPLOAD_DIR # UPLOAD_DIR will be used for test images
+from main import app # UPLOAD_DIR removed
 from services.face_detection import detect_faces
 from db import crud
 from models import models
@@ -75,28 +75,28 @@ def create_test_image_file(
 
 # Fixtures for test images
 @pytest.fixture(scope="function")
-def single_face_image_path():
+def single_face_image_path(tmp_path): # Use pytest's tmp_path fixture for temporary files
     # UPLOAD_DIR is cleaned by test_main.py's fixture
     return create_test_image_file(
-        UPLOAD_DIR, "single_face.jpg", 200, 200, "white", faces_rects=[[50, 50, 40, 40]]
+        str(tmp_path), "single_face.jpg", 200, 200, "white", faces_rects=[[50, 50, 40, 40]]
     )
 
 @pytest.fixture(scope="function")
-def no_face_image_path():
+def no_face_image_path(tmp_path):
     return create_test_image_file(
-        UPLOAD_DIR, "no_face.jpg", 200, 200, "white", faces_rects=[]
+        str(tmp_path), "no_face.jpg", 200, 200, "white", faces_rects=[]
     )
 
 @pytest.fixture(scope="function")
-def multi_face_image_path():
+def multi_face_image_path(tmp_path):
     return create_test_image_file(
-        UPLOAD_DIR, "multi_face.jpg", 300, 300, "white",
+        str(tmp_path), "multi_face.jpg", 300, 300, "white",
         faces_rects=[[50, 50, 40, 40], [150, 150, 50, 50], [100, 200, 30, 30]]
     )
 
 @pytest.fixture(scope="function")
-def corrupted_image_path():
-    filepath = os.path.join(UPLOAD_DIR, "corrupted.jpg")
+def corrupted_image_path(tmp_path):
+    filepath = os.path.join(str(tmp_path), "corrupted.jpg")
     with open(filepath, "w") as f:
         f.write("This is not a valid image file.")
     return filepath
@@ -281,7 +281,7 @@ def test_api_get_face_detections_image_file_missing(db_session, single_face_imag
 # ValueError for corrupted image (handled as 500 "Invalid image file or format") is also distinct.
 # A FileNotFoundError for the cascade XML currently falls into the generic Exception catch-all in the API endpoint, returning 500.
 
-print(f"Test UPLOAD_DIR for face_detection tests: {os.path.abspath(UPLOAD_DIR)}")
+# print(f"Test UPLOAD_DIR for face_detection tests: {os.path.abspath(UPLOAD_DIR)}") # UPLOAD_DIR removed
 print(f"CV2 Haar Cascades Path: {cv2.data.haarcascades}")
 # Check if the default cascade file actually exists in the environment
 default_cascade_file = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')

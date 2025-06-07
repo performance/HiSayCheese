@@ -8,7 +8,7 @@ from db.database import get_db
 from db import crud
 from models.models import UserCreate, UserSchema # User model itself is used via crud.get_user_by_email
 from auth_utils import verify_password, create_access_token
-from ..main import limiter, get_dynamic_rate_limit # Import limiter and the dynamic rate limit function
+from rate_limiter import limiter, get_dynamic_rate_limit # Import from new rate_limiter module
 
 # Import EmailService and config
 from services.email_service import EmailService

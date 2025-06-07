@@ -556,7 +556,7 @@ def test_login_incorrect_password(db_session: Session):
 # Running `pytest` from the project root directory is usually the best practice.
 
 # --- Imports for Email Verification Tests ---
-from moto import mock_ses
+from moto import mock_ses # This should be fine for moto v5 if ses extra is installed
 from unittest.mock import patch
 from config import FRONTEND_URL # For checking email link construction
 from datetime import datetime, timedelta # For manipulating token expiry

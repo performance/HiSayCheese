@@ -17,21 +17,33 @@ import io
 # JSONResponse is not strictly needed if returning Pydantic model with status_code
 # from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware # Import for CORS
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseCall
+from starlette.middleware.base import BaseHTTPMiddleware # RequestResponseCall removed
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse # Renamed to avoid conflict with FastAPI's Response
 from starlette.types import ASGIApp # Added for middleware
+from typing import Callable, Awaitable, Any # Added for RequestResponseCall definition and Any type
 
-# Rate Limiting
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.models import Limit # For parsing rate limit strings
-from slowapi.util import parse_many # To parse rate limit strings like "100/minute"
+# Define RequestResponseCall if not available from starlette directly
+RequestResponseCall = Callable[[Request], Awaitable[StarletteResponse]]
+
+# Rate Limiting - Moved to rate_limiter.py
+# from slowapi import Limiter, _rate_limit_exceeded_handler # Now in rate_limiter.py
+from slowapi.errors import RateLimitExceeded # Still needed for exception handler
+# from limits.util import parse_many # Now in rate_limiter.py
+from rate_limiter import limiter, get_dynamic_rate_limit, ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT # Import from new module
 
 from fastapi.responses import JSONResponse # For the exception handler
+# HTTPBearer, HTTPAuthorizationCredentials, jwt, JWTError, SECRET_KEY, ALGORITHM are used by rate_limiter.py
+# No longer need to be directly imported in main.py IF they are only for rate limiting logic.
+# However, get_request_identifier_for_rate_limit in main.py (if it were still here) would need them.
+# Let's check if they are used elsewhere in main.py...
+# SECRET_KEY, ALGORITHM are used by RequestIdMiddleware for user_id logging.
+# HTTPBearer, HTTPAuthorizationCredentials, jwt, JWTError are also used by RequestIdMiddleware.
+# So, these specific imports need to remain in main.py for RequestIdMiddleware.
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
-from config import SECRET_KEY, ALGORITHM # For decoding JWT
+from config import SECRET_KEY, ALGORITHM
+
 
 from db.database import create_db_and_tables, get_db
 from db import crud
@@ -41,8 +53,15 @@ from models import models # This imports the models module
 # Corrected import for models to include User, EnhancementHistoryBase, ImageCreate
 from models import models # This imports the models module
 from models.models import User, EnhancementHistoryBase, ImageCreate # Added User, EnhancementHistoryBase, ImageCreate
-import logging # Added logging
+# import logging # Added logging
+from pythonjsonlogger import jsonlogger # For JSON logging
+import logging # Standard logging
+import sentry_sdk # For Sentry integration
+from sentry_sdk.integrations.logging import LoggingIntegration # Sentry logging integration
 from typing import List # Added for FaceDetection models
+
+# Import SENTRY_DSN from config
+from config import SENTRY_DSN
 
 from services.face_detection import detect_faces # Added for face detection endpoint
 from services.image_quality import analyze_image_quality # New import
@@ -123,9 +142,65 @@ class ProcessedImageResponse(BaseModel):
 # Maximum request body size (e.g., 1MB for general JSON, file uploads are separate)
 MAX_REQUEST_BODY_SIZE = 1 * 1024 * 1024  # 1MB
 
+# Middleware for adding Request ID
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse:
+        request_id = uuid.uuid4().hex
+        request.state.request_id = request_id
+
+        # Attempt to get user_id from token
+        user_id_for_log = None
+        try:
+            token_creds = await HTTPBearer(auto_error=False)(request)
+            if token_creds and token_creds.credentials:
+                token = token_creds.credentials
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                user_id_for_log = payload.get("user_id") or payload.get("sub")
+        except JWTError:
+            # Token might be invalid or expired, or not present. Fine for logging.
+            pass
+        except Exception:
+            # Other unexpected errors during token processing for logging.
+            pass
+        request.state.user_id = user_id_for_log
+
+        original_log_record_factory = logging.getLogRecordFactory()
+
+        # Keep track of whether we've set our custom factory for this request
+        # to avoid issues if middleware is somehow re-entered or for nested calls.
+        # This is a simple flag; more robust solutions might use contextvars for logger state.
+        # For FastAPI/Starlette middleware, dispatch is usually called once per request.
+
+        current_factory = logging.getLogRecordFactory()
+        # Check if the factory is already our custom one (e.g. from a previous middleware instance, though unlikely for this setup)
+        # This check is more illustrative; direct reset in `finally` is the key.
+        is_custom_factory_active = hasattr(current_factory, '_is_request_id_factory')
+
+
+        def new_log_record_factory(*args, **kwargs):
+            record = original_log_record_factory(*args, **kwargs)
+            # Ensure request.state attributes are accessed safely
+            record.request_id = getattr(request.state, 'request_id', 'N/A')
+            record.user_id = getattr(request.state, 'user_id', None)
+            return record
+
+        # Mark our factory so we could potentially identify it, though direct reset is better.
+        # new_log_record_factory._is_request_id_factory = True
+
+        logging.setLogRecordFactory(new_log_record_factory)
+
+        try:
+            response = await call_next(request)
+        finally:
+            # Always reset to the original factory captured at the start of this dispatch
+            logging.setLogRecordFactory(original_log_record_factory)
+
+        response.headers['X-Request-ID'] = request_id
+        return response
+
 # Middleware for adding security headers
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse: # Changed Response to StarletteResponse
         response = await call_next(request)
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
@@ -182,61 +257,9 @@ class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         return response
 
-# Optional Bearer token scheme for rate limiter key function
-oauth2_scheme_optional = HTTPBearer(auto_error=False)
-
-# Define rate limit strings
-AUTH_USER_RATE_LIMIT = "100/minute"
-ANON_USER_RATE_LIMIT = "20/minute"
-
-# New key function for rate limiting (modified to add prefixes)
-# This is the corrected and single version of this function.
-def get_request_identifier_for_rate_limit(request: Request, creds: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme_optional)) -> str:
-    identifier_type = "ip" # To help with logging prefix
-    identifier = request.client.host
-    try:
-        if creds and creds.credentials:
-            token = creds.credentials
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            user_id = payload.get("user_id")
-            if user_id:
-                identifier = str(user_id)
-                identifier_type = "user"
-                # logger.debug(f"Rate limiting by user_id: {identifier}") # Covered by prefix log
-            else:
-                sub = payload.get("sub")
-                if sub:
-                    identifier = str(sub)
-                    identifier_type = "sub"
-                    # logger.debug(f"Rate limiting by token subject (sub): {identifier}") # Covered by prefix log
-                else:
-                    logger.warning("Token present but no 'user_id' or 'sub' claim found. Falling back to IP.")
-            return f"{identifier_type}:{identifier}"
-    except JWTError as e:
-        logger.warning(f"JWTError during token decoding for rate limit key: {e}. Falling back to IP.")
-    except Exception as e:
-        logger.error(f"Unexpected error in get_request_identifier_for_rate_limit: {e}. Falling back to IP.")
-
-    # Fallback to IP if token processing failed or no token
-    key = f"ip:{request.client.host}"
-    request.state.rate_limit_key = key # Store for header middleware
-    logger.debug(f"Rate limiting by {key} for request to {request.url.path}")
-    return key
-
-
-# Function to get dynamic rate limit based on key prefix
-def get_dynamic_rate_limit(key: str) -> str:
-    if key.startswith("user:") or key.startswith("sub:"):
-        logger.debug(f"Applying authenticated user rate limit for key: {key}")
-        return AUTH_USER_RATE_LIMIT
-    else: # Starts with "ip:" or is an unexpected format (default to anon)
-        if not key.startswith("ip:"):
-            logger.warning(f"Unexpected key format '{key}' for dynamic rate limit, applying anonymous limit.")
-        logger.debug(f"Applying anonymous user rate limit for key: {key}")
-        return ANON_USER_RATE_LIMIT
-
-# Initialize Limiter with the new key function
-limiter = Limiter(key_func=get_request_identifier_for_rate_limit)
+# oauth2_scheme_optional, AUTH_USER_RATE_LIMIT, ANON_USER_RATE_LIMIT,
+# get_request_identifier_for_rate_limit, get_dynamic_rate_limit, and limiter initialization
+# are now in rate_limiter.py. We import 'limiter' and 'get_dynamic_rate_limit'.
 
 # Middleware for adding X-RateLimit headers
 class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
@@ -263,10 +286,10 @@ class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
                     logger.error(f"Could not parse rate string: {rate_string} for key {key}")
                     return response
 
-                current_limit_obj: Limit = current_limit_obj_list[0]
+                current_limit_obj: Any = current_limit_obj_list[0] # Type changed to Any
 
                 # Get window stats
-                # get_window_stats expects a slowapi.models.Limit object, not just the string.
+                # get_window_stats expects a parsed limit object from 'limits' library.
                 window_stats = limiter_instance.storage.get_window_stats(key, current_limit_obj)
 
                 reset_time = int(window_stats[0])
@@ -295,16 +318,18 @@ async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExc
 
     try:
         key = exc.key if hasattr(exc, 'key') else getattr(request.state, 'rate_limit_key', None)
-        limit_obj = exc.limit if hasattr(exc, 'limit') else None
+        # exc.limit is the specific limit object that was hit
+        limit_obj_hit = exc.limit if hasattr(exc, 'limit') else None
 
-        if key and limit_obj and hasattr(request.app.state, 'limiter'):
+        if key and limit_obj_hit and hasattr(request.app.state, 'limiter'):
             limiter_instance: Limiter = request.app.state.limiter
-            window_stats = limiter_instance.storage.get_window_stats(key, limit_obj) # exc.limit should be a Limit object
+            # get_window_stats expects the specific limit object that was hit
+            window_stats = limiter_instance.storage.get_window_stats(key, limit_obj_hit)
 
             reset_time = int(window_stats[0])
             # Remaining is 0 because the limit was exceeded
 
-            response.headers["X-RateLimit-Limit"] = str(limit_obj.amount)
+            response.headers["X-RateLimit-Limit"] = str(limit_obj_hit.amount)
             response.headers["X-RateLimit-Remaining"] = "0"
             response.headers["X-RateLimit-Reset"] = str(reset_time)
             logger.debug(f"Added rate limit headers to 429 response for key {key}")
@@ -329,6 +354,8 @@ app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
 # However, if other middlewares might modify requests in ways that CORS should see,
 # or if CORS needs to act before them, adjust order.
 # For typical setup, CORS first is common.
+# RequestIdMiddleware should be one of the very first, to ensure ID is available for all subsequent logs.
+app.add_middleware(RequestIdMiddleware) # Added RequestIdMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # Placeholder: Should be restricted in production via env var
@@ -351,9 +378,51 @@ app.add_middleware(RateLimitHeaderMiddleware)
 app.include_router(auth_router.router) # Include the auth router
 app.include_router(users_router.router) # Include the users router
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure JSON logging
+logger = logging.getLogger(__name__) # Get logger instance first
+logger.setLevel(logging.INFO) # Set level for the logger instance
+
+# Remove existing handlers if any (e.g., from basicConfig)
+# This is important if basicConfig was called before or if running in an env that pre-configures logging
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+for handler in logger.handlers[:]: # Also clear handlers for the specific logger instance
+    logger.removeHandler(handler)
+
+log_handler = logging.StreamHandler()
+# Updated formatter to include request_id and user_id
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(module)s %(funcName)s %(lineno)d %(message)s %(request_id)s %(user_id)s')
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+
+# If you want the root logger to also use this format (e.g., for logs from other libraries)
+# you might need to configure the root logger similarly.
+# However, often it's better to configure only your application's logger.
+# For now, let's also configure the root logger to ensure all logs are JSON.
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO) # Set level for root logger
+# Remove any default handlers from root logger
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+root_logger.addHandler(log_handler) # Add our JSON handler to root
+
+# logger = logging.getLogger(__name__) # This line is now redundant as logger is already configured
+
+# Initialize Sentry
+if SENTRY_DSN and SENTRY_DSN != "your-sentry-dsn-goes-here":
+    sentry_logging = LoggingIntegration(
+        level=logging.DEBUG,        # Breadcrumbs level
+        event_level=logging.INFO    # Event level (INFO and above)
+    )
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[sentry_logging],
+        traces_sample_rate=1.0, # Capture 100% of transactions for performance monitoring
+        profiles_sample_rate=1.0 # Capture 100% of profiles for performance monitoring
+    )
+    logger.info("Sentry initialized.")
+else:
+    logger.warning("Sentry DSN not found or is placeholder. Sentry will not be initialized.")
 
 # Instantiate StorageService
 try:
@@ -389,8 +458,10 @@ def on_startup():
 
 @app.get("/health", response_model=models.NumberSchema) # Corrected to NumberSchema
 async def health(db: Session = Depends(get_db)):
+    logger.info("Processing /health endpoint.") # ADD THIS LINE
     db_number = crud.get_number(db)
     if db_number is None:
+        # logger.info("/health: No number set yet.") # Optional: good for debugging
         return JSONResponse(status_code=404, content={"message": "No number set yet"})
     return db_number
 
@@ -408,6 +479,18 @@ async def increment_number_endpoint(db: Session = Depends(get_db)):
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
+
+@app.get("/test-error")
+async def test_error_endpoint():
+    try:
+        raise ValueError("Test error for Sentry")
+    except ValueError as e:
+        logger.error("Intentional test error occurred", exc_info=True)
+        # Re-raise or return error response, depending on desired test behavior
+        # For testing Sentry, just logging it might be enough if Sentry is hooked into logging
+        # For testing actual HTTP response, re-raise or return specific status
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Intentional test error")
+
 
 # Placeholder malware scan function
 async def scan_for_malware(contents: bytes) -> bool:
@@ -918,37 +1001,35 @@ async def get_auto_enhancement_parameters(
 @app.post("/api/enhancement/apply", response_model=ProcessedImageResponse)
 @limiter.limit(get_dynamic_rate_limit)
 async def apply_image_enhancements_endpoint(
-    # The 'request: Request' parameter for FastAPI/Starlette must come before `request: ImageEnhancementRequest` (Pydantic model)
-    # So, we rename one of them. Let's rename the FastAPI/Starlette request.
-    http_request: Request, # Renamed to avoid conflict with Pydantic model 'request'
-    request: ImageEnhancementRequest, # This is the Pydantic model for the request body
+    request: Request, # Changed from http_request to request for slowapi
+    request_body_model: ImageEnhancementRequest, # Changed from request to request_body_model
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user) # Added current_user
 ):
-    logger.info(f"Received request to apply enhancements for image_id: {request.image_id} by user: {current_user.id}") # Log user
+    logger.info(f"Received request to apply enhancements for image_id: {request_body_model.image_id} by user: {current_user.id}") # Log user
 
-    db_image = crud.get_image(db, image_id=request.image_id)
+    db_image = crud.get_image(db, image_id=request_body_model.image_id)
     if not db_image:
-        logger.warning(f"Apply Enhancement: Image not found in DB for id: {request.image_id}")
+        logger.warning(f"Apply Enhancement: Image not found in DB for id: {request_body_model.image_id}")
         # Return 200 OK with error message in body as per ProcessedImageResponse model for client handling
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="Failed to apply enhancements.",
-            error=f"Image with id {request.image_id} not found."
+            error=f"Image with id {request_body_model.image_id} not found."
         )
 
     if not db_image.filepath:
-        logger.warning(f"Apply Enhancement: Filepath not available for image_id: {request.image_id}")
+        logger.warning(f"Apply Enhancement: Filepath not available for image_id: {request_body_model.image_id}")
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="Failed to apply enhancements.",
-            error=f"S3 key for image id {request.image_id} not available."
+            error=f"S3 key for image id {request_body_model.image_id} not available."
         )
 
     if not storage_service: # Ensure storage_service is available earlier
         logger.error("StorageService not available for applying enhancements.")
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="Failed to apply enhancements.",
             error="Image storage service is not configured."
         )
@@ -961,38 +1042,38 @@ async def apply_image_enhancements_endpoint(
         base_s3_key_original = os.path.basename(db_image.filepath)
         temp_original_image_path = os.path.join(TEMP_PROCESSING_DIR, f"original_{uuid.uuid4().hex}_{base_s3_key_original}")
 
-        logger.info(f"Apply Enhancement: Downloading original image {db_image.filepath} to {temp_original_image_path} for image_id: {request.image_id}")
+        logger.info(f"Apply Enhancement: Downloading original image {db_image.filepath} to {temp_original_image_path} for image_id: {request_body_model.image_id}")
         storage_service.download_file(object_key=db_image.filepath, destination_path=temp_original_image_path)
 
         face_results = []
-        if request.parameters.face_smooth_intensity > 0:
+        if request_body_model.parameters.face_smooth_intensity > 0:
             try:
-                logger.info(f"Apply Enhancement: Performing face detection on {temp_original_image_path} for image_id: {request.image_id}")
+                logger.info(f"Apply Enhancement: Performing face detection on {temp_original_image_path} for image_id: {request_body_model.image_id}")
                 face_results = detect_faces(temp_original_image_path)
             except Exception as e_face:
-                logger.error(f"Apply Enhancement: Error during face detection for {temp_original_image_path} (image_id {request.image_id}): {e_face}", exc_info=True)
+                logger.error(f"Apply Enhancement: Error during face detection for {temp_original_image_path} (image_id {request_body_model.image_id}): {e_face}", exc_info=True)
                 face_results = [] # Proceed without faces if detection fails
 
-        logger.info(f"Apply Enhancement: Calling apply_enhancements service for image_id: {request.image_id} using {temp_original_image_path}")
+        logger.info(f"Apply Enhancement: Calling apply_enhancements service for image_id: {request_body_model.image_id} using {temp_original_image_path}")
         processed_pil_image = apply_enhancements(
             image_path=temp_original_image_path, # Use temp path of downloaded original image
-            params=request.parameters.model_dump(),
+            params=request_body_model.parameters.model_dump(),
             face_detection_results=face_results
         )
     except HTTPException as e_s3_download: # Catch S3 download errors specifically
-        logger.error(f"Apply Enhancement: S3 download failed for {db_image.filepath} (image_id {request.image_id}): {e_s3_download.detail}")
-        return ProcessedImageResponse(original_image_id=request.image_id, message="Failed to apply enhancements.", error=f"Could not retrieve original image: {e_s3_download.detail}")
+        logger.error(f"Apply Enhancement: S3 download failed for {db_image.filepath} (image_id {request_body_model.image_id}): {e_s3_download.detail}")
+        return ProcessedImageResponse(original_image_id=request_body_model.image_id, message="Failed to apply enhancements.", error=f"Could not retrieve original image: {e_s3_download.detail}")
     except ImageProcessingError as e:
-        logger.error(f"Apply Enhancement: ImageProcessingError for image_id {request.image_id}: {e}", exc_info=True)
+        logger.error(f"Apply Enhancement: ImageProcessingError for image_id {request_body_model.image_id}: {e}", exc_info=True)
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="Failed to apply enhancements due to processing error.",
             error=str(e)
         )
     except Exception as e_process: # Catch other processing errors
-        logger.error(f"Apply Enhancement: Unexpected error during image processing of {temp_original_image_path} for image_id {request.image_id}: {e_process}", exc_info=True)
+        logger.error(f"Apply Enhancement: Unexpected error during image processing of {temp_original_image_path} for image_id {request_body_model.image_id}: {e_process}", exc_info=True)
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="Failed to apply enhancements due to an unexpected server error during processing.",
             error=str(e_process)
         )
@@ -1005,9 +1086,9 @@ async def apply_image_enhancements_endpoint(
                 logger.error(f"Apply Enhancement: Failed to clean up temporary original image {temp_original_image_path}: {e_clean}")
 
     if processed_pil_image is None:
-        logger.error(f"Apply Enhancement: Processing returned None for image_id: {request.image_id} (original path {db_image.filepath})")
+        logger.error(f"Apply Enhancement: Processing returned None for image_id: {request_body_model.image_id} (original path {db_image.filepath})")
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="Failed to apply enhancements.",
             error="Image processing returned no result."
         )
@@ -1019,7 +1100,7 @@ async def apply_image_enhancements_endpoint(
         if not storage_service:
             logger.error("StorageService somehow became unavailable before S3 upload of processed image.")
             # This should ideally not be reached if the check after fetching db_image is in place.
-            return ProcessedImageResponse(original_image_id=request.image_id, message="Failed to apply enhancements.", error="Storage service unavailable for upload.")
+            return ProcessedImageResponse(original_image_id=request_body_model.image_id, message="Failed to apply enhancements.", error="Storage service unavailable for upload.")
 
         # Convert PIL image to bytes in memory
         image_bytes_io = BytesIO()
@@ -1029,7 +1110,7 @@ async def apply_image_enhancements_endpoint(
         # Generate S3 object key
         s3_processed_object_key = f"processed_images/{db_image.id}_enhanced_{uuid.uuid4().hex}.png"
 
-        logger.info(f"Apply Enhancement: Uploading processed image for id {request.image_id} to S3 key: {s3_processed_object_key}")
+        logger.info(f"Apply Enhancement: Uploading processed image for id {request_body_model.image_id} to S3 key: {s3_processed_object_key}")
         storage_service.upload_file(
             file_obj=image_bytes_io,
             object_key=s3_processed_object_key,
@@ -1061,7 +1142,7 @@ async def apply_image_enhancements_endpoint(
             logger.info(f"Apply Enhancement: Created DB record for S3 processed image with ID: {db_processed_image_record.id}")
 
             # Create EnhancementHistory record
-            parameters_json_str = json.dumps(request.parameters.model_dump())
+            parameters_json_str = json.dumps(request_body_model.parameters.model_dump())
             history_create_data = EnhancementHistoryBase(
                 original_image_id=db_image.id,
                 processed_image_id=db_processed_image_record.id,
@@ -1071,7 +1152,7 @@ async def apply_image_enhancements_endpoint(
             logger.info(f"Apply Enhancement: Enhancement history record created for user {current_user.id}, original image {db_image.id}, processed S3 image {db_processed_image_record.id}")
 
         except Exception as db_error:
-            logger.error(f"Apply Enhancement: Error during DB operations for S3 processed image (original image id {request.image_id}): {db_error}", exc_info=True)
+            logger.error(f"Apply Enhancement: Error during DB operations for S3 processed image (original image id {request_body_model.image_id}): {db_error}", exc_info=True)
             # If DB ops fail, S3 object still exists. We might need a cleanup mechanism for orphaned S3 objects.
             # For now, return the S3 key or a presigned URL if possible, but flag that DB ops failed.
             # The processed_image_id_for_response will be None if create_image failed.
@@ -1085,18 +1166,18 @@ async def apply_image_enhancements_endpoint(
             # Return S3 key as path if presigned URL fails, or handle as critical error
 
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             processed_image_id=processed_image_id_for_response,
             processed_image_path=presigned_url or s3_processed_object_key, # Fallback to S3 key if URL gen fails
             message="Image enhancements applied and uploaded to S3 successfully." + (" DB record updated." if processed_image_id_for_response else " DB record update failed.")
         )
     except HTTPException as e: # Re-raise HTTPExceptions from storage_service.upload_file
-        logger.error(f"Apply Enhancement: HTTPException during S3 upload for {request.image_id}: {e.detail}", exc_info=True)
-        return ProcessedImageResponse(original_image_id=request.image_id, message="Failed to apply enhancements.", error=f"S3 upload error: {e.detail}")
+        logger.error(f"Apply Enhancement: HTTPException during S3 upload for {request_body_model.image_id}: {e.detail}", exc_info=True)
+        return ProcessedImageResponse(original_image_id=request_body_model.image_id, message="Failed to apply enhancements.", error=f"S3 upload error: {e.detail}")
     except Exception as e:
-        logger.error(f"Apply Enhancement: Unexpected error during S3 upload or processing for {request.image_id}: {e}", exc_info=True)
+        logger.error(f"Apply Enhancement: Unexpected error during S3 upload or processing for {request_body_model.image_id}: {e}", exc_info=True)
         return ProcessedImageResponse(
-            original_image_id=request.image_id,
+            original_image_id=request_body_model.image_id,
             message="An unexpected error occurred while processing and uploading the enhanced image.",
             error=str(e)
         )
@@ -1105,7 +1186,7 @@ async def apply_image_enhancements_endpoint(
 @app.post("/api/enhancement/apply-preset/{preset_id}", response_model=ProcessedImageResponse)
 @limiter.limit(get_dynamic_rate_limit)
 async def apply_preset_to_image_endpoint(
-    http_request: Request, # Renamed to avoid conflict
+    request: Request, # Changed http_request to request for slowapi
     preset_id: uuid.UUID,
     request_data: ApplyPresetRequest, # This is the Pydantic model for the request body
     db: Session = Depends(get_db),

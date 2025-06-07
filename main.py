@@ -73,6 +73,7 @@ from io import BytesIO # Import BytesIO
 
 from routers import auth as auth_router # Import the auth router
 from routers import users as users_router # Import the users router
+from routers import health as health_router # Import the health router
 from auth_utils import get_current_user # Added for current_user dependency
 
 # Pydantic model for content moderation result
@@ -406,6 +407,7 @@ app.add_middleware(RateLimitHeaderMiddleware)
 # and exception handlers are added.
 app.include_router(auth_router.router) # Include the auth router
 app.include_router(users_router.router) # Include the users router
+app.include_router(health_router.router) # Include the health router
 
 # Configure JSON logging
 logger = logging.getLogger(__name__) # Get logger instance first

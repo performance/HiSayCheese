@@ -19,3 +19,4 @@ sentry-sdk[fastapi]
 python-multipart
 limits>=1.6,<3.0 # Dependency for slowapi, good to make explicit
 moto[s3,ses]==5.0.10 # For mocking AWS services like S3 and SES. Added specific extras and version.
+python-dotenv

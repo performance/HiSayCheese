@@ -110,6 +110,21 @@ HiSayCheese offers an innovative solution: users can simply upload a selfie, and
 *   A detailed project blueprint, **`docs/blueprint.md`**, has been drafted. This document outlines the core features, development phases, and initial design considerations for the "Headshot Handcrafter" concept, which is now evolving into HiSayCheese.
 *   The domain **`HiSayCheese.com` is owned** and will be the primary brand for the product.
 
+## Environment Configuration
+
+This application uses environment variables for configuration. For local development, you can manage these variables using a `.env` file.
+
+1.  **Copy the example file**:
+    ```bash
+    cp .env.example .env
+    ```
+2.  **Edit `.env`**: Open the `.env` file and fill in the required values for your local setup. This file typically includes database connection strings, API keys, and other sensitive information.
+3.  **Security Note**: The `.env` file should **never** be committed to version control. It is included in the `.gitignore` file to prevent accidental commits.
+
+For production and staging environments, environment variables should be set directly in the deployment system (e.g., Docker environment variables, Kubernetes ConfigMaps/Secrets, Heroku config vars, etc.). The application will read these variables at startup.
+
+The application will validate required configurations on startup and will fail gracefully if any critical variable is missing, providing an error message indicating what is needed.
+
 ## Google Cloud Vision API Configuration
 
 This application uses the Google Cloud Vision API for content moderation (portrait and SafeSearch detection).

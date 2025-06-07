@@ -117,9 +117,9 @@ class EnhancementHistory(Base):
     __tablename__ = "enhancement_history"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    original_image_id = Column(UUID(as_uuid=True), ForeignKey("images.id"), nullable=False)
-    processed_image_id = Column(UUID(as_uuid=True), ForeignKey("images.id"), nullable=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    original_image_id = Column(UUID(as_uuid=True), ForeignKey("images.id"), nullable=False, index=True)
+    processed_image_id = Column(UUID(as_uuid=True), ForeignKey("images.id"), nullable=True, index=True)
     parameters_json = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 

@@ -22,6 +22,7 @@ from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse # Renamed to avoid conflict with FastAPI's Response
 from starlette.types import ASGIApp # Added for middleware
 from typing import Callable, Awaitable, Any # Added for RequestResponseCall definition and Any type
+import time # For ResponseTimeLoggingMiddleware
 
 # Define RequestResponseCall if not available from starlette directly
 RequestResponseCall = Callable[[Request], Awaitable[StarletteResponse]]
@@ -141,6 +142,33 @@ class ProcessedImageResponse(BaseModel):
 
 # Maximum request body size (e.g., 1MB for general JSON, file uploads are separate)
 MAX_REQUEST_BODY_SIZE = 1 * 1024 * 1024  # 1MB
+
+# Middleware for logging response times
+class ResponseTimeLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseCall) -> StarletteResponse:
+        start_time = time.time()
+        response = await call_next(request)
+        process_time_ms = (time.time() - start_time) * 1000
+
+        # logger instance is already defined globally in main.py (logger = logging.getLogger(__name__))
+        # RequestIdMiddleware already adds request_id and user_id to log records if available.
+        # So, we just need to log the additional details.
+
+        log_details = {
+            "path": request.url.path,
+            "method": request.method,
+            "status_code": response.status_code,
+            "response_time_ms": round(process_time_ms, 2)
+        }
+        # request_id and user_id will be added by RequestIdMiddleware's factory if this log goes through it.
+        # If this middleware is *after* RequestIdMiddleware, these attributes are already on request.state
+        # and thus will be picked up by the custom log record factory.
+        # To be more robust, explicitly pass request_id and user_id if available.
+        log_details["request_id"] = getattr(request.state, 'request_id', None)
+        log_details["user_id"] = getattr(request.state, 'user_id', None)
+        logger.info("Request processed", extra=log_details)
+
+        return response
 
 # Middleware for adding Request ID
 class RequestIdMiddleware(BaseHTTPMiddleware):
@@ -355,7 +383,8 @@ app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
 # or if CORS needs to act before them, adjust order.
 # For typical setup, CORS first is common.
 # RequestIdMiddleware should be one of the very first, to ensure ID is available for all subsequent logs.
-app.add_middleware(RequestIdMiddleware) # Added RequestIdMiddleware
+app.add_middleware(RequestIdMiddleware)
+app.add_middleware(ResponseTimeLoggingMiddleware) # Added ResponseTimeLoggingMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # Placeholder: Should be restricted in production via env var
@@ -390,8 +419,8 @@ for handler in logger.handlers[:]: # Also clear handlers for the specific logger
     logger.removeHandler(handler)
 
 log_handler = logging.StreamHandler()
-# Updated formatter to include request_id and user_id
-formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(module)s %(funcName)s %(lineno)d %(message)s %(request_id)s %(user_id)s')
+# Updated formatter to include request_id, user_id, path, method, status_code, response_time_ms
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(module)s %(funcName)s %(lineno)d %(message)s %(request_id)s %(user_id)s %(path)s %(method)s %(status_code)s %(response_time_ms)s')
 log_handler.setFormatter(formatter)
 logger.addHandler(log_handler)
 

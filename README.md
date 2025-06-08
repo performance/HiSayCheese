@@ -198,9 +198,9 @@ Until the email is verified, access to certain protected API endpoints will be r
 *   **Primary Name:** HiSayCheese (utilizing the owned domain `HiSayCheese.com`)
 *   **Internal/Alternative Name:** Headshot Handcrafter (as used in `docs/blueprint.md` and internal planning documents)
 
-## How to Contribute (Placeholder)
+## How to Contribute
 
-We welcome contributions! Please see `CONTRIBUTING.md` (link to be created) for guidelines on how to get involved with the project.
+We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to set up your development environment, run tests, and submit pull requests. For more details on our testing philosophy and practices, please refer to [TESTING.md](TESTING.md).
 
 ## License (Placeholder)
 

@@ -32,9 +32,8 @@ Before you begin, ensure you have the following installed on your system:
 
 *   **Node.js:** We recommend using the latest LTS version. You can download it from [nodejs.org](https://nodejs.org/).
 *   **npm or Yarn:** npm is included with Node.js. Yarn can be installed from [yarnpkg.com](https://yarnpkg.com/). This guide will use `npm` in examples. The project appears to use npm based on `package-lock.json`, but `package.json` specifies yarn under `packageManager`. Examples will use npm.
-*   **Python:** We recommend using Python 3.9 or newer. You can download it from [python.org](https://www.python.org/).
+*   **Python:** We recommend using Python 3.11.9. You can download it from [python.org](https://www.python.org/). or use pyenv.
 *   **pip:** Python's package installer, usually comes with Python.
-*   **Virtualenv (recommended):** For managing Python dependencies in isolated environments. Install with `pip install virtualenv`.
 
 ### Cloning the Repository
 
@@ -54,12 +53,12 @@ Before you begin, ensure you have the following installed on your system:
     ```
 2.  Create and activate a Python virtual environment:
     ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+    python -m venv .venv
+    source .venv/bin/activate  # On Windows use `venv\Scripts\activate`
     ```
 3.  Install the required Python dependencies:
     ```bash
-    pip install -r requirements.txt -r requirements-dev.txt
+    pip install -r requirements.txt 
     ```
 
 ### Frontend Setup
@@ -72,7 +71,7 @@ Before you begin, ensure you have the following installed on your system:
 2.  Install the JavaScript dependencies:
     ```bash
     npm install
-    # Or if you prefer yarn (note package.json specifies yarn as packageManager):
+    # Or if you prefer yarn 
     # yarn install
     ```
 
@@ -154,7 +153,7 @@ Our frontend uses tools like ESLint for linting and Prettier for formatting.
 
 ### Backend Tests
 
-The backend uses `pytest` for running tests. `pytest` is included in `backend/requirements-dev.txt`.
+The backend uses `pytest` for running tests. `pytest` is included in `backend/requirements.txt`.
 
 1.  Ensure your Python virtual environment is activated and you are in the `backend` directory.
 2.  Run all tests:
@@ -169,13 +168,14 @@ The backend uses `pytest` for running tests. `pytest` is included in `backend/re
 
 ### Frontend Tests
 
-The frontend likely uses a framework like Jest with React Testing Library, but a specific `test` script is not found in `package.json`.
+The frontend should use a framework like Jest with React Testing Library, 
+but a specific `test` script is not there yet in `package.json`.
 
 1.  Navigate to the `frontend` directory.
-2.  There is no explicit `npm test` script. You may need to:
-    *   Check project documentation for instructions on running tests.
+2.  There is no explicit `npm test` script yet. You need to create all of it:
+    *   Update project documentation for instructions on running tests.
     *   Configure a test runner like Jest or Vitest if not already set up.
-    *   Use available scripts like `npm run typecheck` (for TypeScript checking) if that's part of the testing strategy.
+    *   Use available scripts like `npm run typecheck` (for TypeScript checking) as part of the testing.
 
 ## Submitting Pull Requests
 
@@ -183,31 +183,31 @@ We actively welcome your pull requests!
 
 ### Branching Strategy
 
-*   Create your feature branches from the `main` branch (or `develop` if it's the primary development branch).
+*   Create your feature branches from the `main` branch. 
 *   Name your branches descriptively, e.g., `feature/add-new-filter` or `bugfix/fix-login-issue`.
 
 ### Commit Messages
 
 *   Use clear and concise commit messages.
-*   Follow conventional commit formats if the project uses them (e.g., `feat: add user profile page`, `fix: resolve issue with image upload`).
+*   Follow conventional commit formats (e.g., `feat: add user profile page`, `fix: resolve issue with image upload`).
 *   A good commit message should briefly explain *what* was changed and *why*.
 
 ### PR Checklist
 
 Before submitting your PR, please ensure you have:
 
-1.  **Forked the repository and created your branch from `main` (or `develop`).**
+1.  **Forked the repository and created your branch from `main`.**
 2.  **Made your changes in a separate branch.** Do not commit directly to `main` in your fork if you intend to send a PR.
 3.  **Followed the coding style guides** for the project.
-4.  **Added relevant tests** for any new features or bug fixes.
-5.  **Ensured all tests pass** locally (e.g., `pytest` for backend; verify frontend testing strategy).
-6.  **Run linters and formatters** and fixed any issues.
-7.  **Tested your changes end-to-end.** This means verifying that your changes work as expected within the entire application flow, not just in isolation. For example, if you changed a backend API, ensure the frontend that consumes it still works correctly.
-8.  **Written a clear and detailed PR description.** Explain the problem you are solving and the changes you made. Include screenshots or GIFs if they help illustrate UI changes.
-9.  **Linked any relevant issues** in your PR description (e.g., "Closes #123").
-10. **Updated documentation** if your changes affect user-facing features or how developers build/run the project.
+4.  **Run linters and formatters** and fixed any issues.
+5.  **Added relevant tests** for any new features or bug fixes.
+6.  **Ensured all tests pass** locally (e.g., `pytest` for backend; verify frontend testing strategy).
+7.  **Updated documentation** if your changes affect user-facing features or how developers build/run the project.
+8.  **Tested your changes end-to-end.** This means verifying that your changes work as expected within the entire application flow, not just in isolation. For example, if you changed a backend API, ensure the frontend that consumes it still works correctly.
+9.  **Written a clear and detailed PR description.** Explain the problem you are solving and the changes you made. Include screenshots or GIFs if they help illustrate UI changes.
+10.  **Linked any relevant issues** in your PR description (e.g., "Closes #123").
 
-Once you've submitted your PR, a team member will review it. Please be responsive to any feedback or questions.
+Once you've submitted your PR, a team member will review it. 
 
 Thank you for contributing!
 ```

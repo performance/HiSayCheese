@@ -70,6 +70,10 @@ export default function HeadshotApp() {
   const [carouselSlides, setCarouselSlides] = useState<CarouselSlide[]>([]);
   const [isAssessingQuality, setIsAssessingQuality] = useState(false);
   const [isUploading, setIsUploading] = useState(false); // New state for upload status
+  const [uploadedObjectKey, setUploadedObjectKey] = useState<string | null>(null); // For S3 object key of original
+  const [backendAnalysisResults, setBackendAnalysisResults] = useState<any | null>(null); // For results from /api/images/analyze
+  const [backendEnhancedImageUrl, setBackendEnhancedImageUrl] = useState<string | null>(null); // For URL from /api/images/apply-enhancements
+
 
   const [isTestMode, setIsTestMode] = useState<boolean>(false);
   const [carouselApi, setCarouselApi] = useState<CarouselApi>();
@@ -155,17 +159,26 @@ export default function HeadshotApp() {
     }
 
 
-    if (enhancementJourney?.enhancedPhotoDataUri) {
+    if (enhancementJourney?.enhancedPhotoDataUri && !backendEnhancedImageUrl) { // Show Genkit AI if backend one isn't there yet
       slides.push({
-        id: 'ai-enhanced',
-        title: 'AI Enhanced Headshot',
+        id: 'ai-enhanced-genkit', // differentiate
+        title: 'AI Enhanced Headshot (Genkit)',
         imageSrc: enhancementJourney.enhancedPhotoDataUri,
-        altText: 'AI Enhanced headshot',
+        altText: 'AI Enhanced headshot by Genkit',
         isAiEnhanced: true,
       });
-    } 
+    }
+    if (backendEnhancedImageUrl) {
+      slides.push({
+        id: 'ai-enhanced-backend', // differentiate
+        title: 'AI Enhanced Headshot (Backend)',
+        imageSrc: backendEnhancedImageUrl,
+        altText: 'AI Enhanced headshot by Backend',
+        isAiEnhanced: true, // Use same styling for now
+      });
+    }
     setCarouselSlides(slides);
-  }, [originalImage, imageQualityAssessment, suggestionRationale, enhancementJourney]); 
+  }, [originalImage, imageQualityAssessment, suggestionRationale, enhancementJourney, backendEnhancedImageUrl]);
 
   // Effect for Carousel API
   useEffect(() => {
@@ -269,9 +282,7 @@ export default function HeadshotApp() {
       // Use the URL from the backend response for display
       setOriginalImage(uploadData.file_url);
       setUploadedImage(uploadData.file_url);
-      // Optionally, store object_key if needed for other operations:
-      // const [uploadedObjectKey, setUploadedObjectKey] = useState<string | null>(null);
-      // setUploadedObjectKey(uploadData.object_key);
+      setUploadedObjectKey(uploadData.object_key); // Store the object key
 
       setCarouselSlides([
         { id: 'original', title: 'Original Image', imageSrc: uploadData.file_url, altText: 'Original uploaded image' },
@@ -279,23 +290,60 @@ export default function HeadshotApp() {
 
       toast({
         title: "Image Uploaded",
-        description: "Successfully processed. Now assessing quality...",
+        description: "Successfully processed. Now performing backend analysis...",
       });
 
-      // Now proceed with AI quality assessment using the generated data URI
+      // Call backend analysis endpoint
+      if (uploadData.object_key) {
+        try {
+          // TODO: Replace with actual token retrieval mechanism
+          const DUMMY_AUTH_TOKEN = "test-only-token"; // Placeholder, replace with actual token
+          const analysisResponse = await fetch('/api/images/analyze', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${DUMMY_AUTH_TOKEN}`, // Placeholder for auth
+            },
+            body: JSON.stringify({ object_key: uploadData.object_key }),
+          });
+
+          if (analysisResponse.ok) {
+            const analysisData = await analysisResponse.json();
+            setBackendAnalysisResults(analysisData);
+            toast({
+              title: "Backend Analysis Complete",
+              description: "Face detection and quality metrics retrieved.",
+            });
+            // console.log("Backend Analysis Results:", analysisData);
+          } else {
+            const errorData = await analysisResponse.json();
+            toast({
+              title: "Backend Analysis Failed",
+              description: errorData.detail || "Could not analyze image via backend.",
+              variant: "destructive",
+            });
+          }
+        } catch (analysisError) {
+          console.error("Error calling backend analysis:", analysisError);
+          toast({
+            title: "Backend Analysis Error",
+            description: `Could not connect to backend analysis service. ${analysisError instanceof Error ? analysisError.message : ''}`,
+            variant: "destructive",
+          });
+        }
+      }
+
+      // Now proceed with existing client-side AI quality assessment (can co-exist or be replaced)
       setIsAssessingQuality(true);
       try {
-        // Use dataUriForAssessment for assessImageQuality
         const assessmentResult = await assessImageQuality({ photoDataUri: dataUriForAssessment });
         setImageQualityAssessment(assessmentResult);
-        // The useEffect for carouselSlides will add the assessment slide
         toast({
-          title: "Image Quality Assessed",
-          description: "Check the assessment panel for details.",
+          title: "Client-side Quality Assessed",
+          description: "Check the assessment panel for client-side details.",
         });
-        // Wait for state update then scroll (useEffect for carouselSlides handles this better)
       } catch (error) {
-        console.error("Error assessing image quality:", error);
+        console.error("Error assessing image quality (client-side):", error);
         toast({
           title: "AI Assessment Error",
           description: `Could not assess image quality. ${error instanceof Error ? error.message : ''}`,
@@ -493,53 +541,91 @@ export default function HeadshotApp() {
        return;
      }
      setIsProcessingEnhancement(true);
-     setEnhancementJourney(null); // Clear previous journey first
-    
-    const currentSettings = {...enhancementValues}; 
+     setEnhancementJourney(null); // Clear previous Genkit journey
+     setBackendEnhancedImageUrl(null); // Clear previous backend enhanced image
 
-     try {
-       const journeyResult = await generateEnhancementJourney({
-         photoDataUri: originalImage, 
-         ...currentSettings,
-       });
-       setEnhancementJourney(journeyResult);
-       // uploadedImage will be updated by the carousel effect when the AI enhanced slide becomes active
-       toast({
-         title: "Enhancement Applied",
-         description: "Image enhanced by AI using current settings. See journey steps below.",
-       });
-        // After applying, ensure the "ai-enhanced" slide is shown if it exists
+    if (!uploadedObjectKey) {
+      toast({
+        title: "Error",
+        description: "No uploaded image object key found. Please upload image again.",
+        variant: "destructive",
+      });
+      setIsProcessingEnhancement(false);
+      return;
+    }
+    
+    // Map frontend enhancementValues (0-1 range, 0.5 is normal) to backend expectations
+    const backendEnhancements = {
+      brightness_target: (enhancementValues.brightness - 0.5) * 100, // Maps 0-1 (0.5 normal) to -50 to 50 (0 normal)
+      contrast_target: enhancementValues.contrast / 0.5,         // Maps 0-1 (0.5 normal) to 0-2 (1.0 normal)
+      saturation_target: enhancementValues.saturation / 0.5,     // Maps 0-1 (0.5 normal) to 0-2 (1.0 normal)
+      background_blur_radius: Math.round(enhancementValues.backgroundBlur * 25), // Maps 0-1 to 0-25 pixels
+      face_smooth_intensity: enhancementValues.faceSmoothing,        // Direct map 0-1
+      // crop_rect is not explicitly handled by sliders in this example, send null or omit
+      crop_rect: null, // Or derive from some other state if crop feature exists
+    };
+
+    const requestBody = {
+      original_object_key: uploadedObjectKey,
+      enhancements: backendEnhancements,
+      mode: mode, // Pass current mode
+    };
+
+    try {
+      // TODO: Replace with actual token retrieval mechanism
+      const DUMMY_AUTH_TOKEN = "test-only-token"; // Placeholder
+      const response = await fetch('/api/images/apply-enhancements', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${DUMMY_AUTH_TOKEN}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (response.ok) {
+        const enhancementData = await response.json();
+        setBackendEnhancedImageUrl(enhancementData.enhanced_file_url);
+        toast({
+          title: "Enhancements Applied (Backend)",
+          description: "Image successfully enhanced by the backend.",
+        });
+        // Scroll to the new backend-enhanced slide
         setTimeout(() => {
-          const enhancedSlideIndex = carouselSlides.findIndex(s => s.id === 'ai-enhanced');
-          if (enhancedSlideIndex !== -1) {
-             carouselApi?.scrollTo(enhancedSlideIndex, false)
-          } else { // If slide not yet created due to state update lag, try again
-            setTimeout(() => {
-                const newSlides = carouselSlides; // Re-check potentially updated slides
-                const newEnhancedSlideIndex = newSlides.findIndex(s => s.id === 'ai-enhanced');
-                if (newEnhancedSlideIndex !== -1) {
-                    carouselApi?.scrollTo(newEnhancedSlideIndex, false);
-                }
-            }, 200);
+          const backendEnhancedSlideIndex = carouselSlides.findIndex(s => s.id === 'ai-enhanced-backend');
+          if (backendEnhancedSlideIndex !== -1) {
+            carouselApi?.scrollTo(backendEnhancedSlideIndex, false);
+          } else { // If slide not yet created due to state update lag
+             setTimeout(() => {
+                // Re-check carouselSlides as it might have updated
+                const currentSlides = carouselSlides; // This might not be the latest, need to access state from effect or pass it
+                const newIndex = currentSlides.findIndex(s => s.id === 'ai-enhanced-backend');
+                if (newIndex !== -1) carouselApi?.scrollTo(newIndex, false);
+             }, 300); // Increased delay
           }
         }, 100);
-
-
-     } catch (error) {
-       console.error("Error applying enhancement journey:", error);
-       toast({
-         title: "Enhancement Error",
-         description: `Could not apply AI enhancements. ${error instanceof Error ? error.message : ''}`,
-         variant: "destructive",
-       });
-       setUploadedImage(originalImage); 
-     } finally {
-       setIsProcessingEnhancement(false);
-     }
+      } else {
+        const errorData = await response.json();
+        toast({
+          title: "Backend Enhancement Failed",
+          description: errorData.detail || "Could not apply enhancements via backend.",
+          variant: "destructive",
+        });
+      }
+    } catch (error) {
+      console.error("Error applying backend enhancements:", error);
+      toast({
+        title: "Enhancement Error",
+        description: `Could not connect to backend enhancement service. ${error instanceof Error ? error.message : ''}`,
+        variant: "destructive",
+      });
+    } finally {
+      setIsProcessingEnhancement(false);
+    }
    };
   
    const getImageStyle = (isAiEnhancedSlide: boolean | undefined): React.CSSProperties => {
-     // If it's an AI-enhanced slide, or no original image, don't apply client-side filters.
+     // If it's an AI-enhanced slide (either Genkit or Backend), or no original image, don't apply client-side filters.
      if (isAiEnhancedSlide || !originalImage) return {};
      // Otherwise, apply client-side filters based on slider values for preview on non-AI-enhanced slides.
      return {

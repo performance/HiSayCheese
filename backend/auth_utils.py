@@ -1,5 +1,5 @@
 from passlib.context import CryptContext
-import uuid # Re-add for dummy UserModel ID
+# import uuid # Removed as it's no longer needed after removing test-only-token dummy user
 
 # Create a CryptContext instance configured for bcrypt
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -57,17 +57,8 @@ def decode_access_token(token: str) -> dict:
 
 # Dependency to get current user
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> UserModel:
-    if token == "test-only-token":
-        # print("DEBUG: Using test-only-token path in get_current_user") # Optional debug print
-        return UserModel(
-            id=uuid.UUID("00000000-0000-0000-0000-000000000000"), # Fixed UUID for predictability in tests
-            email="testtoken@example.com",
-            hashed_password="fake_password_for_test_token_user",
-            is_verified=True
-            # created_at will be defaulted by SQLAlchemy model
-        )
+    # Removed "test-only-token" block, restoring original logic:
 
-    # Original logic starts here
     payload = decode_access_token(token)
 
     email: Optional[str] = payload.get("sub")

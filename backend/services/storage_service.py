@@ -4,12 +4,13 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from fastapi import HTTPException, status
 from typing import Optional
-from unittest.mock import MagicMock
+# Removed: from unittest.mock import MagicMock
 
 # Import configurations from config.py
 try:
     from config import AWS_S3_BUCKET_NAME, AWS_S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 except ImportError:
+    # Fallback for cases where config.py might not be structured as expected
     AWS_S3_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME", "your-s3-bucket-name-fallback")
     AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "us-east-1")
     AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
@@ -17,38 +18,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Holder for the last instance of StorageService created in test mode.
-_current_test_storage_service_instance_holder = {'instance': None}
+# Removed: _current_test_storage_service_instance_holder and its print statement
 
 class StorageService:
     def __init__(self):
-        if os.environ.get("TEST_MODE_NO_S3_CONNECT") == "true":
-            logger.info("StorageService __init__ in TEST_MODE_NO_S3_CONNECT: Initializing with mock s3_client AND mock service methods.")
-            self.s3_client = MagicMock(name="s3_client_mock_in_test_mode")
-            self.bucket_name = AWS_S3_BUCKET_NAME
-            self.region = AWS_S3_REGION
+        # Removed all test mode logic (TEST_MODE_NO_S3_CONNECT, TEST_MODE_S3_UPLOAD_ERROR checks)
+        # Removed MagicMock assignments for self.s3_client and instance methods
+        # Removed storing self in _current_test_storage_service_instance_holder
 
-            # Mock s3_client methods (already present from previous step, ensure comprehensive)
-            self.s3_client.upload_fileobj = MagicMock(name="s3_client.upload_fileobj_mock")
-            self.s3_client.download_file = MagicMock(name="s3_client.download_file_mock")
-            self.s3_client.generate_presigned_url = MagicMock(name="s3_client.generate_presigned_url_mock")
-            self.s3_client.delete_object = MagicMock(name="s3_client.delete_object_mock")
-            self.s3_client.head_bucket = MagicMock(name="s3_client.head_bucket_mock")
-
-            # Replace service instance methods with MagicMocks
-            self.upload_file = MagicMock(name="upload_file_mock_on_instance")
-            self.download_file = MagicMock(name="download_file_mock_on_instance")
-            self.get_public_url = MagicMock(name="get_public_url_mock_on_instance")
-            self.generate_presigned_url = MagicMock(name="generate_presigned_url_mock_on_instance")
-            self.delete_file = MagicMock(name="delete_file_mock_on_instance")
-
-            _current_test_storage_service_instance_holder['instance'] = self
-            return
-
-        # Original __init__ logic starts here
+        # Original __init__ logic restored
         self.bucket_name = AWS_S3_BUCKET_NAME
         self.region = AWS_S3_REGION
-
         try:
             self.s3_client = boto3.client(
                 "s3",
@@ -56,6 +36,7 @@ class StorageService:
                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
                 region_name=self.region
             )
+            # Verify connection or credentials by making a simple call
             self.s3_client.head_bucket(Bucket=self.bucket_name)
             logger.info(f"Successfully connected to S3 bucket: {self.bucket_name} in region: {self.region}")
         except (NoCredentialsError, PartialCredentialsError) as e:
@@ -77,7 +58,6 @@ class StorageService:
             logger.error(f"Unexpected error initializing S3 client: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error initializing S3 client: {e}")
 
-    # Original method definitions remain. In test mode, these are shadowed by the MagicMock attributes.
     def upload_file(self, file_obj, object_key: str, content_type: Optional[str] = None, acl: str = "private") -> str:
         extra_args = {'ACL': acl}
         if content_type:
@@ -113,6 +93,7 @@ class StorageService:
             logger.error(f"Unexpected error during S3 download of {object_key}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error during S3 download: {e}")
 
+
     def get_public_url(self, object_key: str) -> str:
         if self.region and self.region != "us-east-1":
             return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{object_key}"
@@ -147,35 +128,16 @@ class StorageService:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error during S3 deletion: {e}")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    logger.info("Attempting to initialize StorageService...")
-    try:
-        os.environ["TEST_MODE_NO_S3_CONNECT"] = "true"
-        storage = StorageService()
-        logger.info("StorageService initialized.")
-
-        if os.environ.get("TEST_MODE_NO_S3_CONNECT") == "true":
-            print(f"S3 Client is MagicMock: {isinstance(storage.s3_client, MagicMock)}")
-            print(f"upload_file is MagicMock: {isinstance(storage.upload_file, MagicMock)}")
-            storage.upload_file(None, "bucket", "key")
-            storage.upload_file.assert_called_once()
-            print("Mock instance method 'upload_file' called successfully.")
-
-            storage.get_public_url("test_key")
-            storage.get_public_url.assert_called_once_with("test_key")
-            print("Mock instance method 'get_public_url' called successfully.")
-
-            # Accessing the stored instance for further configuration if needed from tests
-            # from backend.services.storage_service import _current_test_storage_service_instance_holder
-            # test_instance = _current_test_storage_service_instance_holder['instance']
-            # assert test_instance is storage
-            # print("Successfully accessed storage instance via holder.")
-
-
-    except HTTPException as e:
-        print(f"HTTPException during StorageService test: {e.detail}")
-    except Exception as e:
-        print(f"Generic error during StorageService test: {e}")
-    finally:
-        if "TEST_MODE_NO_S3_CONNECT" in os.environ:
-            del os.environ["TEST_MODE_NO_S3_CONNECT"]
+    # Original __main__ block, if any, or a simple pass
+    # For example, to test live connection (requires credentials to be set in env):
+    # logging.basicConfig(level=logging.INFO)
+    # logger.info("Attempting to initialize StorageService for live test...")
+    # try:
+    #     storage = StorageService()
+    #     logger.info("StorageService initialized for live test.")
+    #     # Add a test upload/download/delete if desired and if bucket is for testing
+    # except HTTPException as e:
+    #     print(f"HTTPException during StorageService live test: {e.detail}")
+    # except Exception as e:
+    #     print(f"Generic error during StorageService live test: {e}")
+    pass

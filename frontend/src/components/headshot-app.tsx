@@ -230,7 +230,7 @@ export default function HeadshotApp() {
     formData.append('file', file);
 
     try {
-      const response = await fetch('/api/images/upload', {
+      const response = await fetch('/api/users/upload-image', { // Changed URL
         method: 'POST',
         body: formData,
       });
@@ -255,21 +255,26 @@ export default function HeadshotApp() {
         return; // Exit early
       }
 
-      // Backend confirmed upload (and moderation if applicable)
-      // const imageSchemaResponse = await response.json(); // ImageSchema for future use if needed
+      const uploadData = await response.json(); // Parse JSON response
 
-      // Generate data URI for client-side operations (assessImageQuality, display)
-      const dataUri = await new Promise<string>((resolve, reject) => {
+      // Generate data URI for client-side operations (assessImageQuality)
+      // This is kept because assessImageQuality likely needs a base64 data URI
+      const dataUriForAssessment = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onloadend = () => resolve(reader.result as string);
         reader.onerror = reject;
         reader.readAsDataURL(file);
       });
 
-      setOriginalImage(dataUri);
-      setUploadedImage(dataUri);
+      // Use the URL from the backend response for display
+      setOriginalImage(uploadData.file_url);
+      setUploadedImage(uploadData.file_url);
+      // Optionally, store object_key if needed for other operations:
+      // const [uploadedObjectKey, setUploadedObjectKey] = useState<string | null>(null);
+      // setUploadedObjectKey(uploadData.object_key);
+
       setCarouselSlides([
-        { id: 'original', title: 'Original Image', imageSrc: dataUri, altText: 'Original uploaded image' },
+        { id: 'original', title: 'Original Image', imageSrc: uploadData.file_url, altText: 'Original uploaded image' },
       ]);
 
       toast({
@@ -277,10 +282,11 @@ export default function HeadshotApp() {
         description: "Successfully processed. Now assessing quality...",
       });
 
-      // Now proceed with AI quality assessment
+      // Now proceed with AI quality assessment using the generated data URI
       setIsAssessingQuality(true);
       try {
-        const assessmentResult = await assessImageQuality({ photoDataUri: dataUri });
+        // Use dataUriForAssessment for assessImageQuality
+        const assessmentResult = await assessImageQuality({ photoDataUri: dataUriForAssessment });
         setImageQualityAssessment(assessmentResult);
         // The useEffect for carouselSlides will add the assessment slide
         toast({

@@ -251,7 +251,8 @@ class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
         # Skip size check for specific paths like file uploads if they handle streaming separately
         # For example, if '/api/images/upload' handles large files directly.
         # This example applies the limit to most other JSON-based endpoints.
-        if request.url.path == "/api/images/upload": # Assuming this is your upload endpoint
+        # Ensure all file upload endpoints are excluded.
+        if request.url.path in ["/api/images/upload", "/api/users/upload-image"]:
              return await call_next(request)
 
         # Check Content-Length header first

@@ -57,7 +57,7 @@ def decode_access_token(token: str) -> dict:
 
 # Dependency to get current user
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> UserModel:
-    # Removed "test-only-token" block, restoring original logic:
+    # "test-only-token" block REMOVED. This is the original logic.
 
     payload = decode_access_token(token)
 

@@ -73,6 +73,8 @@ export default function HeadshotApp() {
   const [uploadedObjectKey, setUploadedObjectKey] = useState<string | null>(null); // For S3 object key of original
   const [backendAnalysisResults, setBackendAnalysisResults] = useState<any | null>(null); // For results from /api/images/analyze
   const [backendEnhancedImageUrl, setBackendEnhancedImageUrl] = useState<string | null>(null); // For URL from /api/images/apply-enhancements
+  const [manualToken, setManualToken] = useState(''); // For token input field
+  const [authToken, setAuthToken] = useState<string | null>(null); // For currently active auth token
 
 
   const [isTestMode, setIsTestMode] = useState<boolean>(false);
@@ -80,9 +82,36 @@ export default function HeadshotApp() {
     const [currentSlide, setCurrentSlide] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Effect to set initial state on client-side
+  const { toast } = useToast(); // toast needs to be available before handleSaveToken
+
+  const handleSaveToken = () => {
+    if (manualToken.trim() === "") {
+      toast({
+        title: "Token Empty",
+        description: "Please paste a token before saving.",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('authToken', manualToken);
+      setAuthToken(manualToken);
+      toast({
+        title: "Token Saved",
+        description: "Authentication token has been updated and saved to localStorage.",
+      });
+    }
+  };
+
+  // Effect to set initial state and load token on client-side
     useEffect(() => {
-        if (isTestMode) {
+      if (typeof window !== 'undefined') { // Ensure localStorage is available
+        const storedToken = localStorage.getItem('authToken');
+        if (storedToken) {
+          setAuthToken(storedToken);
+        }
+      }
+      if (isTestMode) {
             const generatedTestImages = generateTestImages();
             setTestImages(generatedTestImages);
             // Randomly select a test image only on the client-side
@@ -108,9 +137,7 @@ export default function HeadshotApp() {
         }
     
       setTimeout(() => setIsClient(true), 10);
-  }, []);
-
-  const { toast } = useToast();
+  }, [isTestMode]); // Added isTestMode to dependency array if it influences test image generation
 
   // Update carousel slides when relevant data changes
   useEffect(() => {
@@ -295,28 +322,49 @@ export default function HeadshotApp() {
 
       // Call backend analysis endpoint
       if (uploadData.object_key) {
-        try {
-          // TODO: Replace with actual token retrieval mechanism
-          const DUMMY_AUTH_TOKEN = "test-only-token"; // Placeholder, replace with actual token
-          const analysisResponse = await fetch('/api/images/analyze', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${DUMMY_AUTH_TOKEN}`, // Placeholder for auth
-            },
-            body: JSON.stringify({ object_key: uploadData.object_key }),
+        if (!authToken) {
+          toast({
+            title: "Authentication Token Needed",
+            description: "Please save an auth token to analyze the image with the backend.",
+            variant: "destructive",
           });
-
-          if (analysisResponse.ok) {
-            const analysisData = await analysisResponse.json();
-            setBackendAnalysisResults(analysisData);
-            toast({
-              title: "Backend Analysis Complete",
-              description: "Face detection and quality metrics retrieved.",
+        } else {
+          try {
+            const analysisResponse = await fetch('/api/images/analyze', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`,
+              },
+              body: JSON.stringify({ object_key: uploadData.object_key }),
             });
-            // console.log("Backend Analysis Results:", analysisData);
-          } else {
-            const errorData = await analysisResponse.json();
+
+            if (analysisResponse.ok) {
+              const analysisData = await analysisResponse.json();
+              setBackendAnalysisResults(analysisData);
+              toast({
+                title: "Backend Analysis Complete",
+                description: "Face detection and quality metrics retrieved.",
+              });
+              // console.log("Backend Analysis Results:", analysisData);
+            } else {
+              const errorData = await analysisResponse.json();
+              if (analysisResponse.status === 401) {
+                toast({
+                  title: "Auth Error During Analysis",
+                  description: "Token might be invalid or expired. Please save a new token.",
+                  variant: "destructive",
+                });
+              } else {
+                toast({
+                  title: "Backend Analysis Failed",
+                  description: errorData.detail || "Could not analyze image via backend.",
+                  variant: "destructive",
+                });
+              }
+            }
+          } catch (analysisError) {
+            console.error("Error calling backend analysis:", analysisError);
             toast({
               title: "Backend Analysis Failed",
               description: errorData.detail || "Could not analyze image via backend.",
@@ -330,6 +378,7 @@ export default function HeadshotApp() {
             description: `Could not connect to backend analysis service. ${analysisError instanceof Error ? analysisError.message : ''}`,
             variant: "destructive",
           });
+          }
         }
       }
 
@@ -571,14 +620,22 @@ export default function HeadshotApp() {
       mode: mode, // Pass current mode
     };
 
+    if (!authToken) {
+      toast({
+        title: "Authentication Token Needed",
+        description: "Please save an auth token to apply enhancements with the backend.",
+        variant: "destructive",
+      });
+      setIsProcessingEnhancement(false);
+      return;
+    }
+
     try {
-      // TODO: Replace with actual token retrieval mechanism
-      const DUMMY_AUTH_TOKEN = "test-only-token"; // Placeholder
       const response = await fetch('/api/images/apply-enhancements', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${DUMMY_AUTH_TOKEN}`,
+          'Authorization': `Bearer ${authToken}`,
         },
         body: JSON.stringify(requestBody),
       });
@@ -597,15 +654,21 @@ export default function HeadshotApp() {
             carouselApi?.scrollTo(backendEnhancedSlideIndex, false);
           } else { // If slide not yet created due to state update lag
              setTimeout(() => {
-                // Re-check carouselSlides as it might have updated
-                const currentSlides = carouselSlides; // This might not be the latest, need to access state from effect or pass it
+                const currentSlides = carouselSlides;
                 const newIndex = currentSlides.findIndex(s => s.id === 'ai-enhanced-backend');
                 if (newIndex !== -1) carouselApi?.scrollTo(newIndex, false);
-             }, 300); // Increased delay
+             }, 300);
           }
         }, 100);
       } else {
         const errorData = await response.json();
+        if (response.status === 401) {
+          toast({
+            title: "Auth Error During Enhancement",
+            description: "Token might be invalid or expired. Please save a new token.",
+            variant: "destructive",
+          });
+        } else {
         toast({
           title: "Backend Enhancement Failed",
           description: errorData.detail || "Could not apply enhancements via backend.",
@@ -692,14 +755,22 @@ export default function HeadshotApp() {
             <WandSparkles className="w-4 h-4" />
             <h1 className="text-2xl font-bold text-primary">Headshot Handcrafter</h1>
           </div>
-          <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                  <Checkbox id="test-mode" onCheckedChange={setIsTestMode} />
-                  <Label htmlFor="test-mode">Test Mode</Label>
-              </div>
+          <div className="flex items-center gap-2"> {/* Reduced gap-4 to gap-2 */}
+            <input
+              type="text"
+              placeholder="Paste JWT Token"
+              value={manualToken}
+              onChange={(e) => setManualToken(e.target.value)}
+              className="px-2 py-1 text-xs border rounded-md h-8 focus:ring-primary focus:border-primary" // Basic styling
+            />
+            <Button onClick={handleSaveToken} size="sm" variant="outline" className="h-8 text-xs">Save Token</Button>
+            <div className="flex items-center gap-2 ml-2"> {/* Added ml-2 for spacing */}
+                <Checkbox id="test-mode" onCheckedChange={setIsTestMode} />
+                <Label htmlFor="test-mode" className="text-xs">Test Mode</Label>
+            </div>
             <Select onValueChange={setMode}>
-              <SelectTrigger className="w-[180px]">
-                <SelectValue placeholder="Select a Mode" />
+              <SelectTrigger className="w-[150px] h-8 text-xs"> {/* Adjusted width & height */}
+                <SelectValue placeholder="Mode" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="professional">

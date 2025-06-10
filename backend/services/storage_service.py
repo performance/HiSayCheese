@@ -1,5 +1,5 @@
 import logging
-import os
+import os # os is used for os.environ.get for S3 credentials fallback
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from fastapi import HTTPException, status
@@ -22,9 +22,10 @@ logger = logging.getLogger(__name__)
 
 class StorageService:
     def __init__(self):
-        # Removed all test mode logic (TEST_MODE_NO_S3_CONNECT, TEST_MODE_S3_UPLOAD_ERROR checks)
-        # Removed MagicMock assignments for self.s3_client and instance methods
-        # Removed storing self in _current_test_storage_service_instance_holder
+        # Removed: TEST_MODE_NO_S3_CONNECT logic block
+        # Removed: TEST_MODE_S3_UPLOAD_ERROR logic block
+        # Removed: MagicMock assignments for self.s3_client and instance methods
+        # Removed: Storing self in _current_test_storage_service_instance_holder
 
         # Original __init__ logic restored
         self.bucket_name = AWS_S3_BUCKET_NAME
@@ -93,7 +94,6 @@ class StorageService:
             logger.error(f"Unexpected error during S3 download of {object_key}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error during S3 download: {e}")
 
-
     def get_public_url(self, object_key: str) -> str:
         if self.region and self.region != "us-east-1":
             return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{object_key}"
@@ -128,16 +128,4 @@ class StorageService:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error during S3 deletion: {e}")
 
 if __name__ == "__main__":
-    # Original __main__ block, if any, or a simple pass
-    # For example, to test live connection (requires credentials to be set in env):
-    # logging.basicConfig(level=logging.INFO)
-    # logger.info("Attempting to initialize StorageService for live test...")
-    # try:
-    #     storage = StorageService()
-    #     logger.info("StorageService initialized for live test.")
-    #     # Add a test upload/download/delete if desired and if bucket is for testing
-    # except HTTPException as e:
-    #     print(f"HTTPException during StorageService live test: {e.detail}")
-    # except Exception as e:
-    #     print(f"Generic error during StorageService live test: {e}")
     pass

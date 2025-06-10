@@ -37,7 +37,6 @@ router = APIRouter(
 @router.post("/register", response_model=UserSchema, status_code=status.HTTP_201_CREATED)
 @limiter.limit(get_dynamic_rate_limit) # Use the dynamic rate limit function
 def register_user(
-    request: Request,
     user: UserCreate,
     background_tasks: BackgroundTasks, # Added BackgroundTasks
     db: Session = Depends(get_db)
@@ -83,7 +82,7 @@ def register_user(
 
 @router.post("/login") # Or use "/token" for OAuth2 convention
 @limiter.limit(get_dynamic_rate_limit) # Use the dynamic rate limit function
-async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)): # Removed request: Request
     user = crud.get_user_by_email(db, email=form_data.username)
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
@@ -105,7 +104,7 @@ async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequ
 
 @router.get("/verify-email", response_model=UserSchema)
 @limiter.limit(get_dynamic_rate_limit) # Apply rate limiting
-async def verify_user_email(request: Request, token: str, db: Session = Depends(get_db)):
+async def verify_user_email(token: str, db: Session = Depends(get_db)): # Removed request: Request
     logger.info(f"Attempting email verification with token: {token}")
 
     user = crud.get_user_by_verification_token(db, token=token)

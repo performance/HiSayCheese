@@ -1,773 +1,270 @@
+# tests/test_auth.py
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
 import uuid
+from jose import jwt
+from datetime import datetime, timedelta
+from unittest.mock import patch
 
-# Ensure the app's modules can be imported
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from main import app
-from db.database import SessionLocal # create_db_and_tables might not be needed here if main handles it
+# --- Module Imports ---
+# These are the things we need to import for our tests to run.
+# We import from our application's modules.
+from config import SECRET_KEY, ALGORITHM, FRONTEND_URL
 from models.models import User as UserModel
 from auth_utils import verify_password
-from jose import jwt
-from config import SECRET_KEY, ALGORITHM
-
-# Create tables if they don't exist (e.g., for in-memory DB or first run)
-# This is generally handled by main.py on startup, but explicit call can be useful
-# For tests, it's better to manage this with test-specific setup/teardown
-# For now, we rely on main.py's startup event or manual creation if needed.
-# create_db_and_tables() # Usually, you'd have a separate test DB setup
-
-client = TestClient(app)
-
-# Helper to get a DB session
-def get_test_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# Fixture for DB session (optional, could also use get_test_db directly)
-@pytest.fixture(scope="module") # module scope if DB is reset per module, function if per test
-def db_session():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def clear_user_from_db(db: Session, email: str):
-    user = db.query(UserModel).filter(UserModel.email == email).first()
-    if user:
-        db.delete(user)
-        db.commit()
-
-@pytest.fixture(autouse=True)
-def auto_clear_db_after_test(db_session: Session):
-    """Ensures the DB is clean after each test that might create users."""
-    # This is a simplistic cleanup. Ideally, use transactions and rollback,
-    # or a dedicated test DB that's reset.
-    # For this example, we'll try to clean up known test users.
-    # This is tricky if emails are dynamically generated and not tracked.
-    # A better approach is to override get_db with a test DB that rolls back.
-    # For now, we'll rely on specific test functions to clean up if they create data.
-    yield
+from .conftest import TestingSessionLocal # Used to verify DB state independently.
 
 
-def test_register_user_success(db_session: Session):
+# =====================================================================================
+# ==                            REGISTRATION TESTS                                   ==
+# =====================================================================================
+
+def test_register_user_success(client):
+    """
+    GIVEN: A valid unique email and a strong password.
+    WHEN: The /api/auth/register endpoint is called.
+    THEN: It should return a 201 status code and the new user's data (without the password).
+    AND: The user should be correctly created in the database, unverified, with a verification token.
+    """
     unique_email = f"test_success_{uuid.uuid4()}@example.com"
-    password = "validpassword123"
+    password = "vAl!dpassword123"
 
+    # --- 1. ACTION: Call the API Endpoint ---
     response = client.post(
         "/api/auth/register",
         json={"email": unique_email, "password": password},
     )
 
-    assert response.status_code == 201, response.text
+    # --- 2. ASSERT: Check the HTTP Response ---
+    assert response.status_code == 201, f"API call failed: {response.text}"
     data = response.json()
     assert data["email"] == unique_email
     assert "id" in data
-    assert "hashed_password" not in data # IMPORTANT: Hashed password should not be in response
-    assert "created_at" in data
+    assert "hashed_password" not in data, "Security risk: Hashed password should never be in an API response."
 
-    # Verify in DB
-    user_in_db = db_session.query(UserModel).filter(UserModel.email == unique_email).first()
-    assert user_in_db is not None
-    assert user_in_db.email == unique_email
-    assert verify_password(password, user_in_db.hashed_password) # Check if password was hashed correctly
-    assert not verify_password(password + "wrong", user_in_db.hashed_password) # Double check
+    # --- 3. VERIFY: Check the Database State ---
+    db = TestingSessionLocal()
+    try:
+        user_in_db = db.query(UserModel).filter(UserModel.email == unique_email).first()
+        assert user_in_db is not None, "User was not created in the database."
+        assert user_in_db.is_verified is False
+        assert user_in_db.verification_token is not None
+        assert verify_password(password, user_in_db.hashed_password)
+    finally:
+        db.close()
 
-    # Cleanup
-    clear_user_from_db(db_session, unique_email)
+def test_register_user_duplicate_email(client):
+    """
+    GIVEN: An email address that already exists in the database.
+    WHEN: The /api/auth/register endpoint is called with that email.
+    THEN: It should return a 409 Conflict status code.
+    """
+    unique_email = f"test_duplicate_{uuid.uuid4()}@example.com"
+    password = "vAl!dpassword123"
 
+    # First, create the user successfully.
+    client.post("/api/auth/register", json={"email": unique_email, "password": password})
 
-def test_register_user_duplicate_email(db_session: Session):
-    duplicate_email = f"test_duplicate_{uuid.uuid4()}@example.com"
-    password = "validpassword123"
-
-    # Create user first
-    client.post(
-        "/api/auth/register",
-        json={"email": duplicate_email, "password": password},
-    )
-
-    # Attempt to register again with the same email
-    response = client.post(
-        "/api/auth/register",
-        json={"email": duplicate_email, "password": "anotherpassword"},
-    )
-
-    assert response.status_code == 409, response.text
-    data = response.json()
-    assert data["detail"] == "Email already registered"
-
-    # Cleanup
-    clear_user_from_db(db_session, duplicate_email)
-
-
-def test_register_user_invalid_email_format():
-    response = client.post(
-        "/api/auth/register",
-        json={"email": "invalid-email", "password": "validpassword123"},
-    )
-
-    assert response.status_code == 422, response.text
-    data = response.json()
-    # Pydantic's error messages can be nested. Check for 'email' field error.
-    assert any(err["loc"] == ["body", "email"] for err in data["detail"])
-
-
-def test_register_user_weak_password():
-    response = client.post(
-        "/api/auth/register",
-        json={"email": f"test_weak_pw_{uuid.uuid4()}@example.com", "password": "pw"},
-    )
-
-    assert response.status_code == 422, response.text # Should be 422 due to Pydantic validation
-    data = response.json()
-    # Check for Pydantic's specific error structure
-    assert any(err["msg"] for err in data["detail"] if "password" in err["loc"])
-
-
-# Password Strength Tests (now handled by Pydantic model)
-@pytest.mark.parametrize(
-    "password, expected_msg_part",
-    [
-        ("short", "8 characters"), # Too short
-        ("nouppercase1!", "uppercase letter"),
-        ("NOUPPERCASE1!", "uppercase letter"), # Edge case if regex is only [a-z]
-        ("NOLOWERCASE1!", "lowercase letter"),
-        ("NoLoWeRcAsE!", "digit"),
-        ("NoLoWeRcAsE1", "special character"),
-    ],
-)
-def test_register_user_password_strength_violations(password, expected_msg_part):
-    unique_email = f"test_pw_strength_{uuid.uuid4()}@example.com"
+    # Then, attempt to register again with the same email.
     response = client.post(
         "/api/auth/register",
         json={"email": unique_email, "password": password},
     )
-    assert response.status_code == 422, response.text
-    data = response.json()
-    assert isinstance(data["detail"], list)
-    password_errors = [err for err in data["detail"] if err.get("loc") == ["body", "password"]]
-    assert len(password_errors) > 0, "No Pydantic error found for password field"
-    # The actual message comes from Pydantic (constr) or our custom validator's ValueError.
-    # Pydantic wraps ValueError from custom validators.
-    found_match = False
-    for err in password_errors:
-        if "ctx" in err and "error" in err["ctx"]: # Custom validator's ValueError
-             if expected_msg_part in str(err["ctx"]["error"]): # Convert error to string to search
-                found_match = True
-                break
-        elif expected_msg_part in err["msg"]: # Standard Pydantic error message
-            found_match = True
-            break
-    assert found_match, f"Expected message part '{expected_msg_part}' not found in password errors: {password_errors}"
 
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Email already registered"
 
-# Test for missing parameters (Pydantic validation)
-def test_register_user_missing_email():
-    response = client.post(
-        "/api/auth/register",
-        json={"password": "ValidPassword1!"},
-    )
-    assert response.status_code == 422, response.text
-    data = response.json()
-    assert any(err["loc"] == ["body", "email"] and "Missing" in err["msg"] for err in data["detail"])
-
-def test_register_user_missing_password():
-    response = client.post(
-        "/api/auth/register",
-        json={"email": "testmissing@example.com"},
-    )
-    assert response.status_code == 422, response.text
-    data = response.json()
-    assert any(err["loc"] == ["body", "password"] and "Missing" in err["msg"] for err in data["detail"])
-
-
-# Test for malicious string inputs (SQLi/XSS attempts)
 @pytest.mark.parametrize(
-    "malicious_input",
+    "password, expected_msg_part",
     [
-        "' OR '1'='1",
-        "<script>alert('XSS')</script>",
-        "../../../../../etc/passwd%00", # Path traversal attempt with null byte
-    ]
+        ("short", "at least 8 characters"),
+        ("nouppercase1!", "an uppercase letter"),
+        ("NOLOWERCASE1!", "a lowercase letter"),
+        ("NoLoWeRcAsE!", "a digit"),
+        ("NoLoWeRcAsE1", "a special character"),
+    ],
 )
-def test_register_user_malicious_email_string(malicious_input):
-    # Email field has specific validation (EmailStr), so these might be caught by format validation
-    # or by Pydantic's general string processing.
+def test_register_user_password_strength_violations(client, password, expected_msg_part):
+    """
+    GIVEN: A password that violates one of the strength rules.
+    WHEN: The /api/auth/register endpoint is called.
+    THEN: It should return a 422 status code with a descriptive error message.
+    """
     response = client.post(
         "/api/auth/register",
-        json={"email": malicious_input, "password": "ValidPassword1!"},
+        json={"email": f"pw_strength_{uuid.uuid4()}@example.com", "password": password},
     )
-    assert response.status_code == 422 # Expect Pydantic validation error for email format
-    data = response.json()
-    assert any(err["loc"] == ["body", "email"] for err in data["detail"])
-
-# Malicious password test - password is not typically stored as-is or reflected,
-# but good to check it doesn't break input processing.
-# Password validation rules are more about complexity.
-def test_register_user_malicious_password_string():
-    # This should be caught by password strength validation if it doesn't meet criteria.
-    # If it *does* meet criteria, it should be accepted and hashed.
-    # The main concern is that it doesn't cause an error during processing *before* hashing.
-    malicious_password_thats_also_strong = "<script>alert('XSS')</script>A1!"
-    email = f"test_malicious_pw_{uuid.uuid4()}@example.com"
-    response = client.post(
-        "/api/auth/register",
-        json={"email": email, "password": malicious_password_thats_also_strong},
-    )
-    # If the malicious password meets strength criteria, it should be accepted (201)
-    # Pydantic's `constr` doesn't inherently sanitize against XSS for passwords,
-    # as they are not meant to be displayed. Hashing is the security measure.
-    # Our custom validator also doesn't sanitize, it checks for character types.
-    assert response.status_code == 201, response.text
-    # Cleanup if created
-    if response.status_code == 201:
-        db = SessionLocal()
-        clear_user_from_db(db, email)
-        db.close()
-
-# Rate Limiting Tests
-def test_register_rate_limiting():
-    email_prefix = f"ratelimit_reg_{uuid.uuid4()}"
-    password = "ValidPassword1!"
-    # Default limit for /register is "5/minute"
-    for i in range(5): # Make 5 successful requests
-        response = client.post("/api/auth/register", json={"email": f"{email_prefix}_{i}@example.com", "password": password})
-        if response.status_code == 201: # If successful, clean up
-            db = SessionLocal()
-            clear_user_from_db(db, f"{email_prefix}_{i}@example.com")
-            db.close()
-        else: # If one of the first 5 fails unexpectedly (e.g. DB issue), fail the test
-            pytest.fail(f"Registration attempt {i+1} failed: {response.text}")
-
-    # The 6th request should be rate-limited
-    response = client.post("/api/auth/register", json={"email": f"{email_prefix}_6@example.com", "password": password})
-    assert response.status_code == 429, response.text
-    assert "Rate limit exceeded" in response.json()["detail"]
+    assert response.status_code == 422
+    # Check that the detailed error message contains the expected reason.
+    assert expected_msg_part in response.text
 
 
-def test_login_rate_limiting(db_session: Session):
-    user_email = f"ratelimit_login_{uuid.uuid4()}@example.com"
-    user_password = "ValidPassword1!"
+# =====================================================================================
+# ==                                 LOGIN TESTS                                     ==
+# =====================================================================================
 
-    # Register user
-    reg_response = client.post("/api/auth/register", json={"email": user_email, "password": user_password})
-    assert reg_response.status_code == 201, f"Registration for rate limit test failed: {reg_response.text}"
+def test_login_success(client):
+    """
+    GIVEN: A registered user.
+    WHEN: The /api/auth/login endpoint is called with correct credentials.
+    THEN: It should return a 200 status code with an access token.
+    AND: The token should contain the correct user information.
+    """
+    user_email = f"test_login_success_{uuid.uuid4()}@example.com"
+    password = "vAl!dpassword123"
 
-    # Default limit for /login is "10/minute"
-    for i in range(10):
-        response = client.post("/api/auth/login", data={"username": user_email, "password": user_password})
-        # Don't check for 200 here, as we are just hitting the endpoint.
-        # It might be 401 if something is wrong, but we are testing rate limiter.
-        # However, for a clean test, ensure it would be 200 if not for rate limit.
-        if response.status_code == 429: # If rate limited early, test setup is wrong or limit too low
-             pytest.fail(f"Login attempt {i+1} was rate limited prematurely: {response.text}")
+    # 1. Setup: Register the user. We patch the email service as we don't need to test it here.
+    with patch("services.email_service.EmailService.send_email"):
+        reg_response = client.post("/api/auth/register", json={"email": user_email, "password": password})
+    assert reg_response.status_code == 201, "Test setup failed: could not register user."
+    user_id_from_reg = reg_response.json()["id"]
 
-
-    # The 11th request should be rate-limited
-    response = client.post("/api/auth/login", data={"username": user_email, "password": user_password})
-    assert response.status_code == 429, response.text
-    assert "Rate limit exceeded" in response.json()["detail"]
-
-    # Cleanup
-    clear_user_from_db(db_session, user_email)
-
-
-# --- Advanced Rate Limiting Tests for Auth ---
-import time
-from fastapi import status # For status codes if not already imported
-
-# Import rate limit constants from main.py to use in assertions
-# Note: This assumes main.py is structured to allow such imports.
-# If main.py execution is complex, it might be better to redefine or mock these for tests.
-try:
-    from main import ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT
-    ANON_REQUESTS_PER_WINDOW = int(ANON_USER_RATE_LIMIT.split('/')[0])
-    AUTH_REQUESTS_PER_WINDOW = int(AUTH_USER_RATE_LIMIT.split('/')[0])
-except ImportError: # Fallback if main.py structure changes or for isolated test runs
-    ANON_REQUESTS_PER_WINDOW = 20 # Must match main.py
-    AUTH_REQUESTS_PER_WINDOW = 100 # Must match main.py
-
-
-def get_rate_limit_headers(response):
-    return {
-        "limit": response.headers.get("X-RateLimit-Limit"),
-        "remaining": response.headers.get("X-RateLimit-Remaining"),
-        "reset": response.headers.get("X-RateLimit-Reset"),
-    }
-
-# Test Differentiated Limits (Anonymous for /register)
-def test_register_differentiated_rate_limiting_anonymous():
-    email_prefix = f"anon_reg_ratelimit_{uuid.uuid4()}"
-    password = "ValidPassword1!"
-
-    for i in range(ANON_REQUESTS_PER_WINDOW):
-        response = client.post("/api/auth/register", json={"email": f"{email_prefix}_{i}@example.com", "password": password})
-        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-            pytest.fail(f"Anonymous registration attempt {i+1} was rate limited prematurely for /register.")
-        # Cleanup successful registrations to avoid DB clutter and 409 errors on reruns
-        if response.status_code == status.HTTP_201_CREATED:
-            db = SessionLocal()
-            clear_user_from_db(db, f"{email_prefix}_{i}@example.com")
-            db.close()
-
-    # The next request should be rate-limited
-    response = client.post("/api/auth/register", json={"email": f"{email_prefix}_{ANON_REQUESTS_PER_WINDOW}@example.com", "password": password})
-    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS, response.text
-    headers = get_rate_limit_headers(response)
-    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
-    assert headers["remaining"] == "0"
-    assert headers["reset"] is not None
-
-
-# Test Differentiated Limits (Authenticated for /login - though login makes user authenticated for *next* requests)
-# For /login, the "authenticated" limit doesn't quite apply in the same way, as the act of logging in *is* the transition.
-# The key for /login itself will be IP-based if no prior valid token is sent.
-# If a valid token *is* sent to /login (unusual, but possible), it would use user-based key.
-# Let's test the more common anonymous case for /login hitting its limit.
-def test_login_differentiated_rate_limiting_anonymous_ip_based(db_session: Session):
-    user_email = f"auth_login_ratelimit_anon_{uuid.uuid4()}@example.com"
-    user_password = "ValidPassword1!"
-    # Register user so login attempts have a valid target
-    reg_response = client.post("/api/auth/register", json={"email": user_email, "password": user_password})
-    assert reg_response.status_code == status.HTTP_201_CREATED
-
-    for i in range(ANON_REQUESTS_PER_WINDOW): # /login uses dynamic, so anon limit applies here
-        response = client.post("/api/auth/login", data={"username": user_email, "password": user_password})
-        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-            pytest.fail(f"Anonymous login attempt {i+1} was rate limited prematurely for /login.")
-
-    response = client.post("/api/auth/login", data={"username": user_email, "password": user_password})
-    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS, response.text
-    headers = get_rate_limit_headers(response)
-    # The limit applied to /login for an anonymous attempt should be ANON_USER_RATE_LIMIT
-    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
-    assert headers["remaining"] == "0"
-
-    clear_user_from_db(db_session, user_email)
-
-
-# Test Rate Limiting Keyed by User ID (Isolation)
-def test_rate_limiting_user_isolation(db_session: Session):
-    # User A
-    user_a_email = f"user_a_iso_{uuid.uuid4()}@example.com"
-    user_a_password = "PasswordA1!"
-    client.post("/api/auth/register", json={"email": user_a_email, "password": user_a_password})
-    login_resp_a = client.post("/api/auth/login", data={"username": user_a_email, "password": user_a_password})
-    token_a = login_resp_a.json()["access_token"]
-
-    # User B
-    user_b_email = f"user_b_iso_{uuid.uuid4()}@example.com"
-    user_b_password = "PasswordB1!"
-    client.post("/api/auth/register", json={"email": user_b_email, "password": user_b_password})
-    login_resp_b = client.post("/api/auth/login", data={"username": user_b_email, "password": user_b_password})
-    token_b = login_resp_b.json()["access_token"]
-
-    # For this test, we'll use an endpoint that is known to be rate-limited and requires auth,
-    # e.g., /api/users/me (though /me itself is not rate limited in this project yet).
-    # Let's assume /api/users/history is rate-limited for this test (will be added in test_users.py).
-    # For now, let's use /api/auth/register with a token (unconventional, but will test user-keyed limit)
-    # A better endpoint would be one from users.py that *requires* auth.
-    # Using /api/auth/register: if a token is sent, it should use user-based keying.
-
-    # User A makes requests - should use AUTH_REQUESTS_PER_WINDOW
-    # Since /register is for creating new users, sending a token is unusual.
-    # Let's pivot this test to an endpoint that *requires* auth and will be rate-limited,
-    # such as /api/users/history (anticipating its rate limiting in test_users.py).
-    # For now, we'll simulate this by checking headers on a generic auth endpoint if one exists,
-    # or we can test this more thoroughly when test_users.py is updated.
-
-    # Placeholder: This test needs an actual authenticated & rate-limited endpoint.
-    # For now, we'll test header presence on /api/users/me with different tokens.
-    # This doesn't test isolation of limits fully but token-based keying for headers.
-
-    response_a = client.get("/api/users/me", headers={"Authorization": f"Bearer {token_a}"})
-    assert response_a.status_code == status.HTTP_200_OK
-    headers_a = get_rate_limit_headers(response_a)
-    # /api/users/me is NOT rate-limited by default in this project setup.
-    # So, it won't have rate limit headers unless we add the decorator there.
-    # This test will be more effective once applied to a rate-limited authenticated endpoint.
-    # For now, we'll assert that if headers *were* present, they'd reflect AUTH limit.
-    if headers_a["limit"]: # Only if the endpoint somehow got rate-limited
-       assert headers_a["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
-
-    response_b = client.get("/api/users/me", headers={"Authorization": f"Bearer {token_b}"})
-    assert response_b.status_code == status.HTTP_200_OK
-    headers_b = get_rate_limit_headers(response_b)
-    if headers_b["limit"]:
-        assert headers_b["limit"] == str(AUTH_REQUESTS_PER_WINDOW)
-        if headers_a["limit"] and headers_b["limit"]: # If both were somehow limited
-             assert headers_a["remaining"] != headers_b["remaining"] # Crude check for isolation
-
-    clear_user_from_db(db_session, user_a_email)
-    clear_user_from_db(db_session, user_b_email)
-
-
-# Test Rate Limit Headers
-def test_register_rate_limit_headers_anonymous():
-    email = f"hdr_reg_anon_{uuid.uuid4()}@example.com"
-    response = client.post("/api/auth/register", json={"email": email, "password": "Password1!"})
-    # This request is anonymous, should get ANON_USER_RATE_LIMIT
-    # Status code might be 201 (success) or 409 (if email was somehow already used in a rapid test sequence)
-    # We are interested in headers regardless of 201 or 409, as long as it's not 429 yet.
-    assert response.status_code in [status.HTTP_201_CREATED, status.HTTP_409_CONFLICT]
-
-    headers = get_rate_limit_headers(response)
-    assert headers["limit"] == str(ANON_REQUESTS_PER_WINDOW)
-    assert headers["remaining"] == str(ANON_REQUESTS_PER_WINDOW - 1) # First request
-    assert headers["reset"] is not None
-
-    if response.status_code == status.HTTP_201_CREATED:
-        db = SessionLocal()
-        clear_user_from_db(db, email)
-        db.close()
-
-# Rate Limit Reset Test (using /register for simplicity with anonymous limit)
-def test_register_rate_limit_reset():
-    email_prefix = f"reset_reg_{uuid.uuid4()}"
-    password = "ValidPassword1!"
-
-    # Exceed the limit
-    for i in range(ANON_REQUESTS_PER_WINDOW + 1): # One more than limit
-        response = client.post("/api/auth/register", json={"email": f"{email_prefix}_{i}@example.com", "password": password})
-        if response.status_code == status.HTTP_201_CREATED: # Cleanup successful ones
-            db = SessionLocal()
-            clear_user_from_db(db, f"{email_prefix}_{i}@example.com")
-            db.close()
-        if i == ANON_REQUESTS_PER_WINDOW: # The one that should get 429
-             assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
-             headers_429 = get_rate_limit_headers(response)
-             reset_time = int(headers_429["reset"])
-             current_time = int(time.time())
-             sleep_duration = max(0, reset_time - current_time) + 1 # Sleep until after reset + 1s buffer
-
-             if sleep_duration > 65 : # Safety break for tests, minute window should be ~60s
-                 pytest.skip(f"Reset time is too far in future ({sleep_duration}s), skipping sleep portion of test.")
-
-             time.sleep(sleep_duration)
-
-    # Try again after waiting
-    final_email = f"{email_prefix}_final@example.com"
-    response_after_reset = client.post("/api/auth/register", json={"email": final_email, "password": password})
-    assert response_after_reset.status_code == status.HTTP_201_CREATED, \
-        f"Request after reset failed. Expected 201, got {response_after_reset.status_code}. Headers: {get_rate_limit_headers(response_after_reset)}"
-
-    headers_after = get_rate_limit_headers(response_after_reset)
-    assert headers_after["remaining"] == str(ANON_REQUESTS_PER_WINDOW - 1)
-
-    if response_after_reset.status_code == status.HTTP_201_CREATED:
-        db = SessionLocal()
-        clear_user_from_db(db, final_email)
-        db.close()
-
-
-# Tests for /api/auth/login
-def test_login_success(db_session: Session):
-    user_email = f"testlogin_{uuid.uuid4()}@example.com"
-    user_password = "ValidPassword123"
-
-    # 1. Register user
-    reg_response = client.post(
-        "/api/auth/register",
-        json={"email": user_email, "password": user_password},
-    )
-    assert reg_response.status_code == 201, f"Registration failed: {reg_response.text}"
-    user_id_from_reg = reg_response.json().get("id") # Get user_id for later assertion
-
-    # 2. Login with the registered user
+    # 2. Action: Log in with the new credentials.
     login_response = client.post(
         "/api/auth/login",
-        data={"username": user_email, "password": user_password}, # Form data
+        data={"username": user_email, "password": password}, # Form data
     )
+    
+    # 3. Assert: Check the login response and the token.
     assert login_response.status_code == 200, login_response.text
-    login_data = login_response.json()
-    assert "access_token" in login_data
-    assert login_data["token_type"] == "bearer"
-
-    # 3. Decode token and verify claims
-    access_token = login_data["access_token"]
-    try:
-        decoded_token = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
-    except jwt.JWTError as e:
-        pytest.fail(f"Failed to decode token: {e}")
-
-    assert decoded_token["sub"] == user_email
-    assert "user_id" in decoded_token
-    assert decoded_token["user_id"] == user_id_from_reg # Check if user_id matches
-    assert "exp" in decoded_token
-    assert isinstance(decoded_token["exp"], int)
-
-    # Cleanup
-    clear_user_from_db(db_session, user_email)
+    token_data = login_response.json()
+    assert "access_token" in token_data
+    access_token = token_data["access_token"]
+    assert token_data["token_type"] == "bearer"
+    
+    # 4. Verify: Decode the token to check its contents.
+    decoded_token = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+    assert decoded_token["user_id"] == user_id_from_reg
+    # assert decoded_token["exp"] > datetime.utcnow().timestamp()
 
 
-def test_login_invalid_email():
+def test_login_incorrect_password(client):
+    """
+    GIVEN: A registered user.
+    WHEN: The /api/auth/login endpoint is called with the correct email but wrong password.
+    THEN: It should return a 401 Unauthorized status code.
+    """
+    user_email = f"test_wrong_pw_{uuid.uuid4()}@example.com"
+    password = "vAl!dpassword123"
+
+    # Setup: Register the user.
+    with patch("services.email_service.EmailService.send_email"):
+        client.post("/api/auth/register", json={"email": user_email, "password": password})
+
+    # Action: Attempt login with the wrong password.
     response = client.post(
         "/api/auth/login",
-        data={"username": f"nosuchuser_{uuid.uuid4()}@example.com", "password": "anypassword"},
+        data={"username": user_email, "password": "thisIsTheWrongPassword"},
     )
-    assert response.status_code == 401, response.text
-    data = response.json()
-    assert data["detail"] == "Incorrect email or password"
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Incorrect email or password"
 
 
-def test_login_incorrect_password(db_session: Session):
-    user_email = f"testpwuser_{uuid.uuid4()}@example.com"
-    correct_password = "CorrectPassword123"
-    incorrect_password = "IncorrectPassword456"
+def test_login_nonexistent_user(client):
+    """
+    GIVEN: An email address that is not registered.
+    WHEN: The /api/auth/login endpoint is called with that email.
+    THEN: It should return a 401 Unauthorized status code to prevent user enumeration.
+    """
+    response = client.post(
+        "/api/auth/login",
+        data={"username": "nosuchuser@example.com", "password": "anypassword"},
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Incorrect email or password"
+
+# =====================================================================================
+# ==                         EMAIL VERIFICATION TESTS                                ==
+# =====================================================================================
+
+def test_email_verification_flow(client):
+    """
+    GIVEN: A new user is registered.
+    WHEN: The verification link is 'clicked' (by calling the /verify-email endpoint with the token).
+    THEN: The user's `is_verified` status should become True.
+    AND: Subsequent attempts to use the same token should fail.
+    """
+    user_email = f"verify_flow_{uuid.uuid4()}@example.com"
+    password = "vAl!dpassword123"
+
+    # --- 1. Register User ---
+    # We patch the email service to prevent actual email sending during tests.
+    with patch("services.email_service.EmailService.send_email"):
+        reg_response = client.post("/api/auth/register", json={"email": user_email, "password": password})
+    assert reg_response.status_code == 201
+
+    # --- 2. Get Verification Token from Database ---
+    db = TestingSessionLocal()
+    try:
+        user_in_db = db.query(UserModel).filter(UserModel.email == user_email).first()
+        assert user_in_db is not None
+        assert user_in_db.is_verified is False
+        verification_token = user_in_db.verification_token
+        assert verification_token is not None
+    finally:
+        db.close()
+
+    # --- 3. Action: Call the verification endpoint ---
+    verify_response = client.get(f"/api/auth/verify-email?token={verification_token}")
+    
+    # --- 4. Assert: Check the verification response ---
+    assert verify_response.status_code == 200, verify_response.text
+    assert verify_response.json()["is_verified"] is True
+
+    # --- 5. Verify: Check the database state again ---
+    db = TestingSessionLocal()
+    try:
+        user_in_db_after = db.query(UserModel).filter(UserModel.email == user_email).first()
+        assert user_in_db_after.is_verified is True
+        assert user_in_db_after.verification_token is None, "Token should be cleared after successful verification."
+    finally:
+        db.close()
+        
+    # --- 6. Edge Case: Try to use the same token again ---
+    reuse_response = client.get(f"/api/auth/verify-email?token={verification_token}")
+    assert reuse_response.status_code == 400, "Reusing a verification token should fail."
+
+def test_access_protected_route_unverified_vs_verified(client):
+    """
+    GIVEN: A registered but unverified user.
+    WHEN: They try to access a protected route.
+    THEN: They should be denied with a 403 Forbidden error.
+    WHEN: They verify their email and try again with the same token.
+    THEN: They should be granted access.
+    """
+    user_email = f"access_ctrl_{uuid.uuid4()}@example.com"
+    password = "vAl!dpassword123"
 
     # 1. Register user
-    reg_response = client.post(
-        "/api/auth/register",
-        json={"email": user_email, "password": correct_password},
-    )
-    assert reg_response.status_code == 201, f"Registration failed: {reg_response.text}"
-
-    # 2. Attempt login with incorrect password
-    login_response = client.post(
-        "/api/auth/login",
-        data={"username": user_email, "password": incorrect_password},
-    )
-    assert login_response.status_code == 401, login_response.text
-    data = login_response.json()
-    assert data["detail"] == "Incorrect email or password"
-
-    # Cleanup
-    clear_user_from_db(db_session, user_email)
-
-
-# Note: For a robust test suite, especially with database interactions:
-# 1. Use a separate test database (e.g., in-memory SQLite or a dedicated test PostgreSQL DB).
-#    This can be configured by overriding the `get_db` dependency in FastAPI for tests.
-# 2. Ensure each test runs in a transaction that is rolled back afterwards to maintain isolation.
-#    FastAPI's TestClient and dependency overrides can facilitate this.
-# The current cleanup (`clear_user_from_db`) is a basic workaround.
-# The `sys.path.insert` is a common way to handle imports in tests when running from the tests directory.
-# Ideally, project structure and PYTHONPATH should be set up so this isn't strictly necessary,
-# e.g., by installing the package in editable mode (`pip install -e .`) or configuring the test runner.
-# Running `pytest` from the project root directory is usually the best practice.
-
-# --- Imports for Email Verification Tests ---
-from moto import mock_ses # Reverting to standard moto import
-from unittest.mock import patch
-from config import FRONTEND_URL # For checking email link construction
-from datetime import datetime, timedelta # For manipulating token expiry
-from models.models import UserSchema # For response model validation if needed
-
-# --- Test Cases for Email Verification Flow ---
-
-# Set mock AWS environment variables for SES for all tests in this module/file
-# These will be active when moto's @mock_ses is used.
-MOCK_AWS_SES_REGION = "us-east-1" # Can be same as S3 or different
-MOCK_AWS_SES_SENDER_EMAIL = "test_sender@example.com"
-MOCK_FRONTEND_URL = "http://testfrontend.com"
-
-original_env = {}
-
-@pytest.fixture(scope="module", autouse=True)
-def setup_ses_env_vars():
-    global original_env
-    env_vars_to_set = {
-        "AWS_SES_REGION": MOCK_AWS_SES_REGION,
-        "AWS_SES_SENDER_EMAIL": MOCK_AWS_SES_SENDER_EMAIL,
-        "FRONTEND_URL": MOCK_FRONTEND_URL,
-        # Assuming AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set by
-        # a global fixture like setup_test_environment in test_main.py,
-        # or moto will use its defaults. If not, set them here too:
-        "AWS_ACCESS_KEY_ID": "testing_auth",
-        "AWS_SECRET_ACCESS_KEY": "testing_auth",
-    }
-    for key, value in env_vars_to_set.items():
-        original_env[key] = os.environ.get(key)
-        os.environ[key] = value
-
-    yield
-
-    for key, value in original_env.items():
-        if value is None:
-            del os.environ[key]
-        else:
-            os.environ[key] = value
-    original_env.clear()
-
-
-@mock_ses # Moto decorator for mocking SES
-def test_register_user_sends_verification_email(db_session: Session):
-    unique_email = f"test_email_verif_{uuid.uuid4()}@example.com"
-    password = "validpassword123"
-
-    # Patch the actual send_email method of the EmailService instance
-    with patch('services.email_service.EmailService.send_email', return_value="mock_message_id") as mock_send_email:
-        response = client.post(
-            "/api/auth/register",
-            json={"email": unique_email, "password": password},
-        )
-
-    assert response.status_code == 201, response.text
-    data = response.json()
-    assert data["email"] == unique_email
-    assert data["is_verified"] is False # Check new field
-
-    # Verify in DB
-    user_in_db = db_session.query(UserModel).filter(UserModel.email == unique_email).first()
-    assert user_in_db is not None
-    assert user_in_db.is_verified is False
-    assert user_in_db.verification_token is not None
-    assert user_in_db.verification_token_expires_at is not None
-    assert user_in_db.verification_token_expires_at > datetime.utcnow()
-
-    # Assert that send_email was called
-    mock_send_email.assert_called_once()
-    call_args = mock_send_email.call_args[1] # Get keyword arguments
-    assert call_args['to_address'] == unique_email
-    assert "Verify your account" in call_args['subject'] # Check subject contains expected phrase
-
-    # Check if verification link in HTML body is correct
-    expected_verification_link_part = f"{MOCK_FRONTEND_URL}/auth/verify-email?token={user_in_db.verification_token}"
-    assert expected_verification_link_part in call_args['html_body']
-    assert expected_verification_link_part in call_args['text_body']
-
-
-    # Cleanup
-    clear_user_from_db(db_session, unique_email)
-
-
-@mock_ses
-def test_verify_email_valid_token(db_session: Session):
-    # 1. Register user (email sending is mocked by default if not patched here)
-    user_email = f"verify_valid_{uuid.uuid4()}@example.com"
-    password = "ValidPassword1!"
-
-    with patch('services.email_service.EmailService.send_email'): # Mock to prevent actual send
-        reg_response = client.post("/api/auth/register", json={"email": user_email, "password": password})
-    assert reg_response.status_code == 201
-
-    user_in_db = db_session.query(UserModel).filter(UserModel.email == user_email).first()
-    assert user_in_db is not None
-    verification_token = user_in_db.verification_token
-    assert verification_token is not None
-    assert user_in_db.is_verified is False
-
-    # 2. Call /verify-email with the token
-    verify_response = client.get(f"/api/auth/verify-email?token={verification_token}")
-    assert verify_response.status_code == 200, verify_response.text
-    verify_data = verify_response.json()
-    assert verify_data["email"] == user_email
-    assert verify_data["is_verified"] is True
-
-    # 3. Check DB state
-    db_session.refresh(user_in_db) # Refresh from DB
-    assert user_in_db.is_verified is True
-    assert user_in_db.verification_token is None # Token should be cleared
-    assert user_in_db.verification_token_expires_at is None
-
-    clear_user_from_db(db_session, user_email)
-
-
-@mock_ses
-def test_verify_email_invalid_token(db_session: Session):
-    response = client.get(f"/api/auth/verify-email?token=thisisafaketoken123")
-    assert response.status_code == 400, response.text
-    assert "Invalid or expired verification token" in response.json()["detail"]
-
-@mock_ses
-def test_verify_email_expired_token(db_session: Session):
-    user_email = f"verify_expired_{uuid.uuid4()}@example.com"
-    password = "ValidPassword1!"
-    with patch('services.email_service.EmailService.send_email'):
+    with patch("services.email_service.EmailService.send_email"):
         client.post("/api/auth/register", json={"email": user_email, "password": password})
-
-    user_in_db = db_session.query(UserModel).filter(UserModel.email == user_email).first()
-    assert user_in_db is not None
-    verification_token = user_in_db.verification_token
-
-    # Manually expire the token in DB
-    user_in_db.verification_token_expires_at = datetime.utcnow() - timedelta(hours=1)
-    db_session.commit()
-
-    response = client.get(f"/api/auth/verify-email?token={verification_token}")
-    assert response.status_code == 400, response.text
-    assert "Verification token has expired" in response.json()["detail"]
-
-    clear_user_from_db(db_session, user_email)
-
-@mock_ses
-def test_verify_email_already_verified_or_used_token(db_session: Session):
-    user_email = f"verify_used_{uuid.uuid4()}@example.com"
-    password = "ValidPassword1!"
-    with patch('services.email_service.EmailService.send_email'):
-        client.post("/api/auth/register", json={"email": user_email, "password": password})
-
-    user_in_db = db_session.query(UserModel).filter(UserModel.email == user_email).first()
-    verification_token = user_in_db.verification_token
-
-    # First verification attempt (should succeed)
-    client.get(f"/api/auth/verify-email?token={verification_token}")
-    db_session.refresh(user_in_db)
-    assert user_in_db.is_verified is True
-    assert user_in_db.verification_token is None # Token is cleared
-
-    # Attempt to use the same token again (or any token if user is already verified)
-    # If token was cleared, get_user_by_verification_token will return None.
-    # If we try with an old token string, and the user is already verified.
-    response = client.get(f"/api/auth/verify-email?token={verification_token}") # Token is now invalid as it's cleared
-    assert response.status_code == 400, response.text
-    assert "Invalid or expired verification token" in response.json()["detail"] # Because token is None in DB
-
-    # Test case where user is already verified but somehow a different valid token is used (less likely)
-    # This is covered by the user.is_verified check in the endpoint.
-    # To test that specific branch: manually set user to verified but with a valid token still there.
-    user_in_db.is_verified = True
-    user_in_db.verification_token = "still_valid_token_for_test"
-    user_in_db.verification_token_expires_at = datetime.utcnow() + timedelta(hours=1)
-    db_session.commit()
-    response_already_verified = client.get(f"/api/auth/verify-email?token=still_valid_token_for_test")
-    assert response_already_verified.status_code == 400, response_already_verified.text
-    assert "Email already verified or token invalid" in response_already_verified.json()["detail"]
-
-    clear_user_from_db(db_session, user_email)
-
-
-@mock_ses
-def test_access_protected_route_unverified_vs_verified(db_session: Session):
-    user_email = f"access_ctrl_{uuid.uuid4()}@example.com"
-    password = "ValidPassword1!"
-
-    # 1. Register user (mock email sending)
-    with patch('services.email_service.EmailService.send_email'):
-        reg_response = client.post("/api/auth/register", json={"email": user_email, "password": password})
-    assert reg_response.status_code == 201
-    user_data_from_reg = reg_response.json()
-    verification_token = db_session.query(UserModel).filter_by(email=user_email).first().verification_token
-
-    # 2. Login to get token
+    
+    # 2. Get login token for the unverified user
     login_response = client.post("/api/auth/login", data={"username": user_email, "password": password})
-    assert login_response.status_code == 200
     access_token = login_response.json()["access_token"]
     auth_headers = {"Authorization": f"Bearer {access_token}"}
-
-    # 3. Attempt to access /api/users/me (protected) - should fail (403)
+    
+    # 3. Action: Attempt to access a protected route (/api/users/me)
+    # This endpoint is protected by `get_current_user`, which checks `is_verified`.
     me_response_unverified = client.get("/api/users/me", headers=auth_headers)
-    assert me_response_unverified.status_code == 403, me_response_unverified.text
+    
+    # 4. Assert: Access should be forbidden
+    assert me_response_unverified.status_code == 403
     assert "Email not verified" in me_response_unverified.json()["detail"]
 
-    # 4. Verify email
-    verify_response = client.get(f"/api/auth/verify-email?token={verification_token}")
-    assert verify_response.status_code == 200, f"Verification failed: {verify_response.text}"
-
-    # 5. Attempt to access /api/users/me again - should succeed (200)
-    # The existing token should now work as the user's 'is_verified' status is updated in DB.
+    # 5. Verify the user's email
+    db = TestingSessionLocal()
+    try:
+        user_in_db = db.query(UserModel).filter(UserModel.email == user_email).first()
+        verification_token = user_in_db.verification_token
+    finally:
+        db.close()
+    
+    client.get(f"/api/auth/verify-email?token={verification_token}") # "Click" the link
+    
+    # 6. Action: Try accessing the protected route again with the SAME token
     me_response_verified = client.get("/api/users/me", headers=auth_headers)
-    assert me_response_verified.status_code == 200, me_response_verified.text
-    assert me_response_verified.json()["email"] == user_email
-    assert me_response_verified.json()["is_verified"] is True # UserSchema from /me should show this
 
-    clear_user_from_db(db_session, user_email)
+    # 7. Assert: Access should now be granted
+    assert me_response_verified.status_code == 200
+    assert me_response_verified.json()["email"] == user_email

@@ -4,7 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
 from sqlalchemy.orm import Session
 from typing import List, Optional # Optional might be needed for response models if applicable
 
-from models.models import User, UserSchema, EnhancementHistorySchema, PresetCreate, PresetSchema, PresetUpdate # Added Preset schemas
+from models.models import User
+from schemas.history_schemas import EnhancementHistorySchema
+from schemas.user_schemas import UserSchema
+from schemas.preset_schemas import PresetCreate, PresetSchema, PresetUpdate
 from services.storage_service import StorageService # Added StorageService
 from auth_utils import get_current_user
 from db import crud

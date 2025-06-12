@@ -1,202 +1,170 @@
+# routers/images.py
+import uuid
+import logging
+import magic
 import os
-import tempfile
-import uuid # Needed for generating unique object keys
-import cv2 # Needed for imencode
-import io # Needed for BytesIO
-from typing import List, Optional, Dict, Any # For type hinting
+from io import BytesIO
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status, Request
+from sqlalchemy.orm import Session
+from werkzeug.utils import secure_filename
+from PIL import Image as PILImage
 
-from backend.services.storage_service import StorageService
-from backend.services.face_detection import detect_faces
-from backend.services.image_quality import analyze_image_quality
-from backend.services.apply_image_modifications import apply_all_enhancements
-# calculate_auto_enhancements is not used in this version as per instructions
-# from backend.services.auto_enhancement import calculate_auto_enhancements
+from db import crud
+from db.database import get_db
+from models import models as db_models
+from schemas import image_schemas, analysis_schemas
+from services import storage_service
+from services.content_moderation import moderate_image_content
+from rate_limiter import limiter, get_dynamic_rate_limit
+from pydantic import BaseModel
 
-from backend.auth_utils import get_current_user
-from backend.models.models import User as UserModel # For type hinting current_user
+from dependencies import get_storage_service
+from services.storage_service import StorageService
 
-# --- Pydantic Models ---
+logger = logging.getLogger(__name__)
 
-class AnalyzeImageRequest(BaseModel):
-    object_key: str
-
-class EnhancementParametersRequest(BaseModel):
-    brightness_target: Optional[float] = Field(default=0.0)
-    contrast_target: Optional[float] = Field(default=1.0)
-    saturation_target: Optional[float] = Field(default=1.0)
-    background_blur_radius: Optional[int] = Field(default=0)
-    crop_rect: Optional[List[int]] = Field(default=None, example=[0,0,100,100]) # x,y,w,h
-    face_smooth_intensity: Optional[float] = Field(default=0.0)
-    # face_boxes are not part of the request directly, they are detected if needed
-
-class ApplyEnhancementsRequest(BaseModel):
-    original_object_key: str
-    enhancements: EnhancementParametersRequest
-    mode: Optional[str] = Field(default="default") # For future use or to influence defaults
-
-class ApplyEnhancementsResponse(BaseModel):
-    original_object_key: str
-    enhanced_object_key: str
-    enhanced_file_url: str
-
-# --- Router Definition ---
-
+# THIS IS THE KEY CHANGE: We define a router here.
 router = APIRouter(
     prefix="/api/images",
-    tags=["images"],
-    responses={
-        404: {"description": "Image not found in S3 or analysis/processing failed for specific reasons"},
-        400: {"description": "Bad request, e.g., unprocessable image or invalid parameters"},
-        401: {"description": "Unauthorized"},
-        422: {"description": "Validation error in request body"},
-    }
+    tags=["Image Upload"]
 )
 
-# --- Endpoints ---
+# Constants moved here as they are specific to this router's logic.
+ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
+MIME_TYPE_TO_EXTENSION = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-@router.post("/analyze")
-async def analyze_image_endpoint(
-    request_data: AnalyzeImageRequest,
-    current_user: UserModel = Depends(get_current_user),
-    storage_service: StorageService = Depends(StorageService)
+
+# Placeholder for a more robust malware scanning service
+async def scan_for_malware(contents: bytes) -> bool:
+    """Placeholder for malware scanning logic."""
+    logger.info("Malware scan stub: assuming file is safe.")
+    return True
+
+
+# THE FIX IS HERE: The decorator now uses `@router.post` instead of `@app.post`
+@router.post(
+    "/upload",
+    response_model=image_schemas.ImageSchema,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload, Validate, and Store a New Image"
+)
+@limiter.limit(get_dynamic_rate_limit)
+async def upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    storage: StorageService = Depends(get_storage_service)
 ):
     """
-    Analyzes an image from S3 for face detection and image quality.
+    Handles the full image upload process:
+    1.  Validates file size and MIME type.
+    2.  Performs a (placeholder) malware scan.
+    3.  Moderates content using Google Cloud Vision API for portraits and safety.
+    4.  Extracts image metadata.
+    5.  Uploads approved images to S3.
+    6.  Creates a corresponding record in the database.
+    - Rejected images have their metadata saved for logging/review but are not stored in S3.
     """
-    temp_file_path: Optional[str] = None
+    contents = await file.read()
+    file_size = len(contents)
+
+    # 1. File Size Validation
+    if file_size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE_MB}MB."
+        )
+
+    # 2. File Type Validation (using python-magic for robustness)
+    detected_mime_type = magic.from_buffer(contents, mime=True)
+    if detected_mime_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type: '{detected_mime_type}'. Allowed types are JPG, PNG, WEBP."
+        )
+    file_extension = MIME_TYPE_TO_EXTENSION.get(detected_mime_type)
+
+    # 3. Malware Scan
+    if not await scan_for_malware(contents):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malware detected in file."
+        )
+
+    # 4. Content Moderation
+    moderation_result = await moderate_image_content(contents)
+
+    # 5. Extract Metadata
+    sanitized_filename = secure_filename(file.filename) or f"upload_{uuid.uuid4().hex}"
     try:
-        _, file_extension = os.path.splitext(request_data.object_key)
-        if not file_extension:
-            file_extension = ".tmp"
+        image_pil = PILImage.open(BytesIO(contents))
+        width, height = image_pil.size
+        img_format = image_pil.format
+        exif = image_pil.getexif()
+        exif_orientation = exif.get(0x0112) if exif else None
+        color_profile = "ICC" if 'icc_profile' in image_pil.info else image_pil.mode
+    except Exception as e:
+        logger.error(f"Could not extract metadata from image file '{sanitized_filename}': {e}")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Cannot process image file. It may be corrupt.")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
-            temp_file_path = tmp_file.name
+    # 6. Create initial image data for DB, handle rejection case
+    image_data = image_schemas.ImageCreate(
+        filename=sanitized_filename,
+        filepath=None,  # Set later if approved
+        filesize=file_size,
+        mimetype=detected_mime_type,
+        width=width,
+        height=height,
+        format=img_format,
+        exif_orientation=exif_orientation,
+        color_profile=color_profile,
+        rejection_reason=moderation_result.rejection_reason
+    )
 
-        storage_service.download_file(
-            object_key=request_data.object_key,
-            destination_path=temp_file_path
+    if not moderation_result.is_approved:
+        logger.info(f"Image '{sanitized_filename}' rejected: {moderation_result.rejection_reason}")
+        crud.create_image(db=db, image=image_data) # Log rejected image metadata
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=moderation_result.rejection_reason
         )
 
-        face_results = detect_faces(image_path=temp_file_path)
-        quality_results = analyze_image_quality(image_path=temp_file_path)
-
-        return {
-            "object_key": request_data.object_key,
-            "user_id": current_user.id,
-            "face_detection": face_results,
-            "image_quality": quality_results
-        }
-    except FileNotFoundError:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Temporary image file not found after download.")
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Image format error or unprocessable image: {str(ve)}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        # logger.error(f"Unexpected error during image analysis for {request_data.object_key}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during image analysis: {str(e)}")
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-            except Exception: # pragma: no cover
-                # logger.error(f"Failed to remove temporary file {temp_file_path}: {e_remove}", exc_info=True)
-                pass
-
-
-@router.post("/apply-enhancements", response_model=ApplyEnhancementsResponse)
-async def apply_enhancements_endpoint(
-    request_data: ApplyEnhancementsRequest,
-    current_user: UserModel = Depends(get_current_user),
-    storage_service: StorageService = Depends(StorageService)
-):
-    """
-    Downloads an image from S3, applies specified enhancements,
-    uploads the modified image back to S3, and returns its new key and URL.
-    """
-    temp_original_image_path: Optional[str] = None
+    # 7. Approved: Upload to S3 and finalize DB record
+    s3_object_key = f"original_images/{uuid.uuid4().hex}{file_extension}"
     try:
-        # Determine file extension for temporary file and output
-        _, original_file_extension = os.path.splitext(request_data.original_object_key)
-        if not original_file_extension: # Default if no extension
-            original_file_extension = ".jpg" # Assume JPEG if original has no extension
-
-        output_content_type = "image/jpeg" # Default output
-        if original_file_extension.lower() == ".png":
-            output_content_type = "image/png"
-        # Add more types like webp if necessary
-
-        # Create a temporary file for the original image
-        with tempfile.NamedTemporaryFile(delete=False, suffix=original_file_extension) as tmp_file:
-            temp_original_image_path = tmp_file.name
-
-        # Download original image
-        storage_service.download_file(
-            object_key=request_data.original_object_key,
-            destination_path=temp_original_image_path
+        storage.upload_file(
+            file_obj=BytesIO(contents),
+            object_key=s3_object_key,
+            content_type=detected_mime_type
         )
-
-        # Prepare enhancement parameters
-        enhancement_params_dict = request_data.enhancements.model_dump()
-
-        # If face smoothing is requested, detect faces and add to params
-        if enhancement_params_dict.get("face_smooth_intensity", 0.0) > 0.0:
-            # logger.info(f"Face smoothing requested for {request_data.original_object_key}, detecting faces.")
-            face_detection_results = detect_faces(image_path=temp_original_image_path)
-            enhancement_params_dict["face_boxes"] = [f["box"] for f in face_detection_results.get("faces", []) if f.get("box")]
-
-
-        # Apply enhancements
-        modified_image_np = apply_all_enhancements(
-            image_path=temp_original_image_path,
-            enhancement_params=enhancement_params_dict
-        )
-
-        if modified_image_np is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image processing failed, possibly due to an unsupported image format or an error during enhancement.")
-
-        # Encode modified image to bytes
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90] if output_content_type == "image/jpeg" else None
-        status_encode, image_bytes_np = cv2.imencode(original_file_extension, modified_image_np, encode_param)
-        if not status_encode:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to encode modified image.")
-
-        image_bytes = image_bytes_np.tobytes()
-
-        # Create new object key for the enhanced image
-        new_object_key = f"enhanced_images/{current_user.id}/{uuid.uuid4()}{original_file_extension}"
-
-        # Upload enhanced image to S3
-        storage_service.upload_file(
-            file_obj=io.BytesIO(image_bytes),
-            object_key=new_object_key,
-            content_type=output_content_type # e.g., 'image/jpeg' or 'image/png'
-        )
-
-        enhanced_file_url = storage_service.get_public_url(new_object_key)
-
-        return ApplyEnhancementsResponse(
-            original_object_key=request_data.original_object_key,
-            enhanced_object_key=new_object_key,
-            enhanced_file_url=enhanced_file_url
-        )
-
-    except FileNotFoundError: # Should be caught by storage_service.download_file as 404
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Temporary image file not found after download (apply-enhancements).")
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Image format error or unprocessable image (apply-enhancements): {str(ve)}")
-    except HTTPException: # Re-raise HTTPExceptions (e.g. from download_file or if processing failed with specific HTTP status)
-        raise
+        logger.info(f"Approved image '{sanitized_filename}' uploaded to S3 with key: {s3_object_key}")
+        image_data.filepath = s3_object_key # Update filepath with S3 key
+        image_data.rejection_reason = None # Ensure rejection reason is null for approved images
     except Exception as e:
-        # logger.error(f"Unexpected error during image enhancement for {request_data.original_object_key}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during image enhancement: {str(e)}")
-    finally:
-        if temp_original_image_path and os.path.exists(temp_original_image_path):
-            try:
-                os.remove(temp_original_image_path)
-            except Exception: # pragma: no cover
-                # logger.error(f"Failed to remove temporary original image file {temp_original_image_path}: {e_remove}", exc_info=True)
-                pass
+        logger.error(f"S3 upload failed for '{sanitized_filename}': {e}", exc_info=True)
+        # Attempt to save a record indicating upload failure
+        image_data.rejection_reason = "S3_UPLOAD_FAILED"
+        crud.create_image(db=db, image=image_data)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not upload file to storage."
+        )
+
+    # Create the final DB record for the approved and uploaded image
+    db_image = crud.create_image(db=db, image=image_data)
+
+    # Generate a presigned URL for the client to immediately access the image
+    presigned_url = storage.generate_presigned_url(db_image.filepath)
+
+    # Manually construct the response to include the presigned_url, as it's not part of the DB model
+    response_data = image_schemas.ImageSchema.from_orm(db_image).model_dump()
+    response_data['presigned_url'] = presigned_url
+    
+    return response_data

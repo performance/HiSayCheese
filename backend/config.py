@@ -16,6 +16,22 @@ SECRET_KEY: str = os.getenv("SECRET_KEY", "your-super-secret-key-please-change-i
 ALGORITHM: str = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
+
+# Use "local" for development to bypass Google Vision API
+CONTENT_MODERATION_TYPE = os.environ.get("CONTENT_MODERATION_TYPE", "local")
+
+# --- Email Service Configuration ---
+# Use "console" for local development to print emails to the terminal.
+# Use "ses" for production to send real emails via AWS.
+EMAIL_SERVICE_TYPE = os.environ.get("EMAIL_SERVICE_TYPE", "console") # Default to 'console'
+SENDER_EMAIL_ADDRESS = os.environ.get("SENDER_EMAIL_ADDRESS", "noreply@example.com")
+
+
+# --- NEW: Storage Configuration ---
+# Use "local" for development to avoid needing AWS credentials.
+# Use "s3" for production.
+STORAGE_TYPE = os.environ.get("STORAGE_TYPE", "local") # Default to 'local'
+
 # AWS S3 Configuration
 AWS_S3_BUCKET_NAME: str = os.getenv("AWS_S3_BUCKET_NAME", "your-s3-bucket-name")
 AWS_S3_REGION: str = os.getenv("AWS_S3_REGION", "us-east-1")

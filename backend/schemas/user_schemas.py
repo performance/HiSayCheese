@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, EmailStr, constr, validator
+from pydantic import field_validator
 
 MIN_PASSWORD_LENGTH = 8
 
@@ -13,7 +14,8 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: constr(min_length=MIN_PASSWORD_LENGTH)
 
-    @validator('password')
+    @field_validator('password')
+    @classmethod
     def password_strength(cls, v):
         if not re.search(r"[A-Z]", v):
             raise ValueError('Password must contain an uppercase letter')

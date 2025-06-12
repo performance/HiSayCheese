@@ -66,19 +66,52 @@ export default function HeadshotApp() {
   const [isProcessingEnhancement, setIsProcessingEnhancement] = useState(false);
   const [enhancementJourney, setEnhancementJourney] = useState<GenerateEnhancementJourneyOutput | null>(null);
   const [suggestionRationale, setSuggestionRationale] = useState<SuggestionRationale | null>(null);
-  const [imageQualityAssessment, setImageQualityAssessment] = useState<ImageQualityAssessmentOutput | null>(null); 
+  const [imageQualityAssessment, setImageQualityAssessment] = useState<ImageQualityAssessmentOutput | null>(null);
   const [carouselSlides, setCarouselSlides] = useState<CarouselSlide[]>([]);
   const [isAssessingQuality, setIsAssessingQuality] = useState(false);
   const [isUploading, setIsUploading] = useState(false); // New state for upload status
+  const [uploadedObjectKey, setUploadedObjectKey] = useState<string | null>(null); // For S3 object key of original
+  const [backendAnalysisResults, setBackendAnalysisResults] = useState<any | null>(null); // For results from /api/images/analyze
+  const [backendEnhancedImageUrl, setBackendEnhancedImageUrl] = useState<string | null>(null); // For URL from /api/images/apply-enhancements
+  const [manualToken, setManualToken] = useState(''); // For token input field
+  const [authToken, setAuthToken] = useState<string | null>(null); // For currently active auth token
+
 
   const [isTestMode, setIsTestMode] = useState<boolean>(false);
   const [carouselApi, setCarouselApi] = useState<CarouselApi>();
-    const [currentSlide, setCurrentSlide] = useState(0);
+  const [currentSlide, setCurrentSlide] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Effect to set initial state on client-side
+  const { toast } = useToast(); // toast needs to be available before handleSaveToken
+
+  const handleSaveToken = () => {
+    if (manualToken.trim() === "") {
+      toast({
+        title: "Token Empty",
+        description: "Please paste a token before saving.",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('authToken', manualToken);
+      setAuthToken(manualToken);
+      toast({
+        title: "Token Saved",
+        description: "Authentication token has been updated and saved to localStorage.",
+      });
+    }
+  };
+
+  // Effect to set initial state and load token on client-side
     useEffect(() => {
-        if (isTestMode) {
+      if (typeof window !== 'undefined') { // Ensure localStorage is available
+        const storedToken = localStorage.getItem('authToken');
+        if (storedToken) {
+          setAuthToken(storedToken);
+        }
+      }
+      if (isTestMode) {
             const generatedTestImages = generateTestImages();
             setTestImages(generatedTestImages);
             // Randomly select a test image only on the client-side
@@ -102,11 +135,9 @@ export default function HeadshotApp() {
                 obstructionScore: randomTestImage.qualityScores.obstructions,
             });
         }
-    
-      setTimeout(() => setIsClient(true), 10);
-  }, []);
 
-  const { toast } = useToast();
+      setTimeout(() => setIsClient(true), 10);
+  }, [isTestMode]); // Added isTestMode to dependency array if it influences test image generation
 
   // Update carousel slides when relevant data changes
   useEffect(() => {
@@ -139,7 +170,7 @@ export default function HeadshotApp() {
         ),
       });
     }
-    
+
     if (suggestionRationale && !enhancementJourney) {
        slides.push({
         id: 'suggestions-ready',
@@ -155,17 +186,26 @@ export default function HeadshotApp() {
     }
 
 
-    if (enhancementJourney?.enhancedPhotoDataUri) {
+    if (enhancementJourney?.enhancedPhotoDataUri && !backendEnhancedImageUrl) { // Show Genkit AI if backend one isn't there yet
       slides.push({
-        id: 'ai-enhanced',
-        title: 'AI Enhanced Headshot',
+        id: 'ai-enhanced-genkit', // differentiate
+        title: 'AI Enhanced Headshot (Genkit)',
         imageSrc: enhancementJourney.enhancedPhotoDataUri,
-        altText: 'AI Enhanced headshot',
+        altText: 'AI Enhanced headshot by Genkit',
         isAiEnhanced: true,
       });
-    } 
+    }
+    if (backendEnhancedImageUrl) {
+      slides.push({
+        id: 'ai-enhanced-backend', // differentiate
+        title: 'AI Enhanced Headshot (Backend)',
+        imageSrc: backendEnhancedImageUrl,
+        altText: 'AI Enhanced headshot by Backend',
+        isAiEnhanced: true, // Use same styling for now
+      });
+    }
     setCarouselSlides(slides);
-  }, [originalImage, imageQualityAssessment, suggestionRationale, enhancementJourney]); 
+  }, [originalImage, imageQualityAssessment, suggestionRationale, enhancementJourney, backendEnhancedImageUrl]);
 
   // Effect for Carousel API
   useEffect(() => {
@@ -192,7 +232,7 @@ export default function HeadshotApp() {
     setUploadedImage(testImage.url);
     setImageQualityAssessment({
         feedback: [] as string[],
-        overallSuitabilityScore: testImage.overallQualityScore, 
+        overallSuitabilityScore: testImage.overallQualityScore,
         frontFacingScore: testImage.qualityScores.frontFacingPose,
         eyeVisibilityScore: testImage.qualityScores.eyeVisibility,
         lightingQualityScore: testImage.qualityScores.lightingQuality,
@@ -202,7 +242,7 @@ export default function HeadshotApp() {
         headToBodyRatioScore: 0.5, // Placeholder value
         obstructionScore: testImage.qualityScores.obstructions,
     });
-    
+
       setCarouselSlides([
           {
               id: 'original',
@@ -230,7 +270,7 @@ export default function HeadshotApp() {
     formData.append('file', file);
 
     try {
-      const response = await fetch('/api/images/upload', {
+      const response = await fetch('/api/users/upload-image', { // Changed URL
         method: 'POST',
         body: formData,
       });
@@ -255,41 +295,97 @@ export default function HeadshotApp() {
         return; // Exit early
       }
 
-      // Backend confirmed upload (and moderation if applicable)
-      // const imageSchemaResponse = await response.json(); // ImageSchema for future use if needed
+      const uploadData = await response.json(); // Parse JSON response
 
-      // Generate data URI for client-side operations (assessImageQuality, display)
-      const dataUri = await new Promise<string>((resolve, reject) => {
+      // Generate data URI for client-side operations (assessImageQuality)
+      // This is kept because assessImageQuality likely needs a base64 data URI
+      const dataUriForAssessment = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onloadend = () => resolve(reader.result as string);
         reader.onerror = reject;
         reader.readAsDataURL(file);
       });
 
-      setOriginalImage(dataUri);
-      setUploadedImage(dataUri);
+      // Use the URL from the backend response for display
+      setOriginalImage(uploadData.file_url);
+      setUploadedImage(uploadData.file_url);
+      setUploadedObjectKey(uploadData.object_key); // Store the object key
+
       setCarouselSlides([
-        { id: 'original', title: 'Original Image', imageSrc: dataUri, altText: 'Original uploaded image' },
+        { id: 'original', title: 'Original Image', imageSrc: uploadData.file_url, altText: 'Original uploaded image' },
       ]);
 
       toast({
         title: "Image Uploaded",
-        description: "Successfully processed. Now assessing quality...",
+        description: "Successfully processed. Now performing backend analysis...",
       });
 
-      // Now proceed with AI quality assessment
+      // Call backend analysis endpoint
+      if (uploadData.object_key) {
+        if (!authToken) {
+          toast({
+            title: "Authentication Token Needed",
+            description: "Please save an auth token to analyze the image with the backend.",
+            variant: "destructive",
+          });
+        } else {
+          try {
+            const analysisResponse = await fetch('/api/images/analyze', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`,
+              },
+              body: JSON.stringify({ object_key: uploadData.object_key }),
+            });
+
+            if (analysisResponse.ok) {
+              const analysisData = await analysisResponse.json();
+              setBackendAnalysisResults(analysisData);
+              toast({
+                title: "Backend Analysis Complete",
+                description: "Face detection and quality metrics retrieved.",
+              });
+              // console.log("Backend Analysis Results:", analysisData);
+            } else {
+              const errorData = await analysisResponse.json();
+              if (analysisResponse.status === 401) {
+                toast({
+                  title: "Auth Error During Analysis",
+                  description: "Token might be invalid or expired. Please save a new token.",
+                  variant: "destructive",
+                });
+              } else {
+                toast({
+                  title: "Backend Analysis Failed",
+                  description: errorData.detail || "Could not analyze image via backend.",
+                  variant: "destructive",
+                });
+              }
+            }
+          } catch (analysisError) {
+            console.error("Error calling backend analysis:", analysisError);
+            toast({
+              title: "Backend Analysis Error",
+              description: `Could not connect to the analysis service. ${analysisError instanceof Error ? analysisError.message : 'Please check your connection.'}`,
+              variant: "destructive",
+            });
+          }
+        }
+      }
+      // --- SYNTAX ERROR WAS HERE: An extra, misplaced `catch` block was removed from this spot ---
+
+      // Now proceed with existing client-side AI quality assessment (can co-exist or be replaced)
       setIsAssessingQuality(true);
       try {
-        const assessmentResult = await assessImageQuality({ photoDataUri: dataUri });
+        const assessmentResult = await assessImageQuality({ photoDataUri: dataUriForAssessment });
         setImageQualityAssessment(assessmentResult);
-        // The useEffect for carouselSlides will add the assessment slide
         toast({
-          title: "Image Quality Assessed",
-          description: "Check the assessment panel for details.",
+          title: "Client-side Quality Assessed",
+          description: "Check the assessment panel for client-side details.",
         });
-        // Wait for state update then scroll (useEffect for carouselSlides handles this better)
       } catch (error) {
-        console.error("Error assessing image quality:", error);
+        console.error("Error assessing image quality (client-side):", error);
         toast({
           title: "AI Assessment Error",
           description: `Could not assess image quality. ${error instanceof Error ? error.message : ''}`,
@@ -446,7 +542,7 @@ export default function HeadshotApp() {
       const suggestions: SuggestEnhancementsOutput = await suggestEnhancements({ photoDataUri: originalImage });
       const animationDurationPerSlider = 400;
       setSuggestionRationale(suggestions.rationale);
-      
+
       // Animate sliders to suggested values
       await animateSlider('brightness', suggestions.brightness, animationDurationPerSlider);
       await animateSlider('contrast', suggestions.contrast, animationDurationPerSlider);
@@ -487,53 +583,106 @@ export default function HeadshotApp() {
        return;
      }
      setIsProcessingEnhancement(true);
-     setEnhancementJourney(null); // Clear previous journey first
-    
-    const currentSettings = {...enhancementValues}; 
+     setEnhancementJourney(null); // Clear previous Genkit journey
+     setBackendEnhancedImageUrl(null); // Clear previous backend enhanced image
 
-     try {
-       const journeyResult = await generateEnhancementJourney({
-         photoDataUri: originalImage, 
-         ...currentSettings,
-       });
-       setEnhancementJourney(journeyResult);
-       // uploadedImage will be updated by the carousel effect when the AI enhanced slide becomes active
-       toast({
-         title: "Enhancement Applied",
-         description: "Image enhanced by AI using current settings. See journey steps below.",
-       });
-        // After applying, ensure the "ai-enhanced" slide is shown if it exists
+    if (!uploadedObjectKey) {
+      toast({
+        title: "Error",
+        description: "No uploaded image object key found. Please upload image again.",
+        variant: "destructive",
+      });
+      setIsProcessingEnhancement(false);
+      return;
+    }
+
+    // Map frontend enhancementValues (0-1 range, 0.5 is normal) to backend expectations
+    const backendEnhancements = {
+      brightness_target: (enhancementValues.brightness - 0.5) * 100, // Maps 0-1 (0.5 normal) to -50 to 50 (0 normal)
+      contrast_target: enhancementValues.contrast / 0.5,         // Maps 0-1 (0.5 normal) to 0-2 (1.0 normal)
+      saturation_target: enhancementValues.saturation / 0.5,     // Maps 0-1 (0.5 normal) to 0-2 (1.0 normal)
+      background_blur_radius: Math.round(enhancementValues.backgroundBlur * 25), // Maps 0-1 to 0-25 pixels
+      face_smooth_intensity: enhancementValues.faceSmoothing,        // Direct map 0-1
+      // crop_rect is not explicitly handled by sliders in this example, send null or omit
+      crop_rect: null, // Or derive from some other state if crop feature exists
+    };
+
+    const requestBody = {
+      original_object_key: uploadedObjectKey,
+      enhancements: backendEnhancements,
+      mode: mode, // Pass current mode
+    };
+
+    if (!authToken) {
+      toast({
+        title: "Authentication Token Needed",
+        description: "Please save an auth token to apply enhancements with the backend.",
+        variant: "destructive",
+      });
+      setIsProcessingEnhancement(false);
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/images/apply-enhancements', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (response.ok) {
+        const enhancementData = await response.json();
+        setBackendEnhancedImageUrl(enhancementData.enhanced_file_url);
+        toast({
+          title: "Enhancements Applied (Backend)",
+          description: "Image successfully enhanced by the backend.",
+        });
+        // Scroll to the new backend-enhanced slide
         setTimeout(() => {
-          const enhancedSlideIndex = carouselSlides.findIndex(s => s.id === 'ai-enhanced');
-          if (enhancedSlideIndex !== -1) {
-             carouselApi?.scrollTo(enhancedSlideIndex, false)
-          } else { // If slide not yet created due to state update lag, try again
-            setTimeout(() => {
-                const newSlides = carouselSlides; // Re-check potentially updated slides
-                const newEnhancedSlideIndex = newSlides.findIndex(s => s.id === 'ai-enhanced');
-                if (newEnhancedSlideIndex !== -1) {
-                    carouselApi?.scrollTo(newEnhancedSlideIndex, false);
-                }
-            }, 200);
+          const backendEnhancedSlideIndex = carouselSlides.findIndex(s => s.id === 'ai-enhanced-backend');
+          if (backendEnhancedSlideIndex !== -1) {
+            carouselApi?.scrollTo(backendEnhancedSlideIndex, false);
+          } else { // If slide not yet created due to state update lag
+             setTimeout(() => {
+                const currentSlides = carouselSlides;
+                const newIndex = currentSlides.findIndex(s => s.id === 'ai-enhanced-backend');
+                if (newIndex !== -1) carouselApi?.scrollTo(newIndex, false);
+             }, 300);
           }
         }, 100);
-
-
-     } catch (error) {
-       console.error("Error applying enhancement journey:", error);
-       toast({
-         title: "Enhancement Error",
-         description: `Could not apply AI enhancements. ${error instanceof Error ? error.message : ''}`,
-         variant: "destructive",
-       });
-       setUploadedImage(originalImage); 
-     } finally {
-       setIsProcessingEnhancement(false);
-     }
+      } else {
+        const errorData = await response.json();
+        if (response.status === 401) {
+          toast({
+            title: "Auth Error During Enhancement",
+            description: "Token might be invalid or expired. Please save a new token.",
+            variant: "destructive",
+          });
+        } else {
+          toast({
+            title: "Backend Enhancement Failed",
+            description: errorData.detail || "Could not apply enhancements via backend.",
+            variant: "destructive",
+          });
+        }
+      }
+    } catch (error) {
+      console.error("Error applying backend enhancements:", error);
+      toast({
+        title: "Enhancement Error",
+        description: `Could not connect to backend enhancement service. ${error instanceof Error ? error.message : ''}`,
+        variant: "destructive",
+      });
+    } finally {
+      setIsProcessingEnhancement(false);
+    }
    };
-  
+
    const getImageStyle = (isAiEnhancedSlide: boolean | undefined): React.CSSProperties => {
-     // If it's an AI-enhanced slide, or no original image, don't apply client-side filters.
+     // If it's an AI-enhanced slide (either Genkit or Backend), or no original image, don't apply client-side filters.
      if (isAiEnhancedSlide || !originalImage) return {};
      // Otherwise, apply client-side filters based on slider values for preview on non-AI-enhanced slides.
      return {
@@ -567,12 +716,12 @@ export default function HeadshotApp() {
 
   const QualityScoreIcon = ({ label, score, icon: Icon, lowIsGood = false, outOf = 10 }: { label: string, score: number, icon: React.ElementType, lowIsGood?: boolean, outOf?:number }) => {
     const displayScore = outOf === 10 ? `${score}/${outOf}` : `${(score * 100 / outOf).toFixed(0)}%`;
-    let scoreColorClass = 'text-primary'; 
+    let scoreColorClass = 'text-primary';
     const percentage = score * (100 / outOf);
 
     if ((!lowIsGood && percentage < 40) || (lowIsGood && percentage >= 70)) scoreColorClass = 'text-destructive';
     else if ((!lowIsGood && percentage < 70) || (lowIsGood && percentage >= 40)) scoreColorClass = 'text-yellow-500';
-    
+
     return (
       <TooltipProvider>
         <Tooltip delayDuration={100}>
@@ -590,8 +739,6 @@ export default function HeadshotApp() {
     );
   };
 
-  // Attempting to add comment and rewrite return statement to fix JSX error.
-
   return (
     <div className="flex flex-col h-screen bg-secondary">
       <header className="bg-card border-b shadow-sm flex-shrink-0">
@@ -600,14 +747,22 @@ export default function HeadshotApp() {
             <WandSparkles className="w-4 h-4" />
             <h1 className="text-2xl font-bold text-primary">Headshot Handcrafter</h1>
           </div>
-          <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                  <Checkbox id="test-mode" onCheckedChange={setIsTestMode} />
-                  <Label htmlFor="test-mode">Test Mode</Label>
-              </div>
+          <div className="flex items-center gap-2"> {/* Reduced gap-4 to gap-2 */}
+            <input
+              type="text"
+              placeholder="Paste JWT Token"
+              value={manualToken}
+              onChange={(e) => setManualToken(e.target.value)}
+              className="px-2 py-1 text-xs border rounded-md h-8 focus:ring-primary focus:border-primary" // Basic styling
+            />
+            <Button onClick={handleSaveToken} size="sm" variant="outline" className="h-8 text-xs">Save Token</Button>
+            <div className="flex items-center gap-2 ml-2"> {/* Added ml-2 for spacing */}
+                <Checkbox id="test-mode" onCheckedChange={setIsTestMode} />
+                <Label htmlFor="test-mode" className="text-xs">Test Mode</Label>
+            </div>
             <Select onValueChange={setMode}>
-              <SelectTrigger className="w-[180px]">
-                <SelectValue placeholder="Select a Mode" />
+              <SelectTrigger className="w-[150px] h-8 text-xs"> {/* Adjusted width & height */}
+                <SelectValue placeholder="Mode" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="professional">
@@ -686,13 +841,13 @@ export default function HeadshotApp() {
                   </CarouselContent>
                   {carouselSlides.length > 1 && (
                     <>
-                        <CarouselPrevious 
-                            variant="ghost" 
+                        <CarouselPrevious
+                            variant="ghost"
                             className="absolute left-2 top-1/2 -translate-y-1/2 z-10 bg-card/50 hover:bg-card/80 disabled:opacity-30"
                             disabled={!carouselApi?.canScrollPrev() || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                         />
-                        <CarouselNext 
-                            variant="ghost" 
+                        <CarouselNext
+                            variant="ghost"
                             className="absolute right-2 top-1/2 -translate-y-1/2 z-10 bg-card/50 hover:bg-card/80 disabled:opacity-30"
                             disabled={!carouselApi?.canScrollNext() || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
                         />
@@ -714,146 +869,147 @@ export default function HeadshotApp() {
                 </div>
               )}
             </div>
-            {/* Controls Column */}
-              <div className="flex flex-col gap-4 pr-1 pb-4 h-full">
-                {isClient && (
-                  <Card className="flex-shrink-0">
-                    <CardHeader>
-                      <CardTitle className="text-xl">Test Images</CardTitle>
-                    </CardHeader>
-                    <CardContent className="grid grid-cols-3 gap-2">
-                      {testImages.map((testImage, index) => (
-                        <img key={index} src={testImage.url} alt={testImage.description}
-                          className={`w-full h-24 object-cover cursor-pointer rounded-md ${selectedTestImage === testImage ? 'ring-2 ring-primary' : ''}`}
-                          onClick={() => handleTestImageSelect(testImage)} />
-                      ))}
-                    </CardContent>
-                  </Card>
-                )}
-              </div>
-              <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full">
-                {/* Image Quality Assessment Panel */}
-                  <Card className="flex-shrink-0">
-                    <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
-                    <CardContent>
-                      {isAssessingQuality && !imageQualityAssessment && (
-                        <div className="grid grid-cols-4 md:grid-cols-8 gap-1">
-                          {Array.from({ length: 9 }).map((_, i) => <Skeleton key={i} className="h-16 w-full" />)}
+            {/* --- LAYOUT FIX: All right-side panels are now inside this single div which acts as the third grid column --- */}
+            <div className="lg:col-span-1 flex flex-col gap-4 overflow-y-auto pr-1 pb-4 h-full">
+              {/* Test Images Panel */}
+              {isClient && isTestMode && (
+                <Card className="flex-shrink-0">
+                  <CardHeader>
+                    <CardTitle className="text-xl">Test Images</CardTitle>
+                  </CardHeader>
+                  <CardContent className="grid grid-cols-3 gap-2">
+                    {testImages.map((testImage, index) => (
+                      <img key={index} src={testImage.url} alt={testImage.description}
+                        className={`w-full h-24 object-cover cursor-pointer rounded-md ${selectedTestImage === testImage ? 'ring-2 ring-primary' : ''}`}
+                        onClick={() => handleTestImageSelect(testImage)} />
+                    ))}
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* Image Quality Assessment Panel */}
+              <Card className="flex-shrink-0">
+                <CardHeader><CardTitle className="text-xl">Image Quality</CardTitle></CardHeader>
+                <CardContent>
+                  {isAssessingQuality && !imageQualityAssessment && (
+                    <div className="grid grid-cols-4 md:grid-cols-8 gap-1">
+                      {Array.from({ length: 9 }).map((_, i) => <Skeleton key={i} className="h-16 w-full" />)}
+                    </div>
+                  )}
+                  {!isAssessingQuality && !originalImage && (
+                    <p className="text-sm text-muted-foreground p-4 text-center">Upload an image for quality assessment.</p>
+                  )}
+                  {imageQualityAssessment && (
+                    isClient && (<>
+                      <div className="grid grid-cols-4 sm:grid-cols-8 gap-1 mb-3">
+                        <QualityScoreIcon label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
+                        <QualityScoreIcon label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
+                        <QualityScoreIcon label="Lighting Quality" score={imageQualityAssessment.lightingQualityScore} icon={Lightbulb} />
+                        <QualityScoreIcon label="Focus/Sharpness" score={imageQualityAssessment.focusSharpnessScore} icon={Aperture} />
+                        <QualityScoreIcon label="Background" score={imageQualityAssessment.backgroundAppropriatenessScore} icon={ImageIcon} />
+                        <QualityScoreIcon label="Expression" score={imageQualityAssessment.expressionAppropriatenessScore} icon={Drama} />
+                        <QualityScoreIcon label="Framing/Ratio" score={imageQualityAssessment.headToBodyRatioScore} icon={Ratio} />
+                        <QualityScoreIcon label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
+                      </div>
+                      <div className="border-t pt-3 mt-3 text-center">
+                        <Label className="text-sm font-medium text-muted-foreground mb-1 block">Overall Suitability</Label>
+                        <QualityScoreIcon label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
+                      </div>
+
+                      {imageQualityAssessment.feedback.length > 0 && (
+                        <div className="mt-4 pt-3 border-t">
+                          <h4 className="text-sm font-semibold mb-1">AI Feedback:</h4>
+                          <ul className="list-disc pl-5 space-y-1 text-xs text-muted-foreground">
+                            {imageQualityAssessment.feedback.map((item, index) => (
+                              <li key={index}>{item}</li>
+                            ))}
+                          </ul>
                         </div>
                       )}
-                      {!isAssessingQuality && !originalImage && (
-                        <p className="text-sm text-muted-foreground p-4 text-center">Upload an image for quality assessment.</p>
-                      )}
-                      {imageQualityAssessment && (
-                        isClient && (<>
-                          <div className="grid grid-cols-4 sm:grid-cols-8 gap-1 mb-3">
-                            <QualityScoreIcon label="Front-Facing Pose" score={imageQualityAssessment.frontFacingScore} icon={Smile} />
-                            <QualityScoreIcon label="Eye Visibility" score={imageQualityAssessment.eyeVisibilityScore} icon={Eye} />
-                            <QualityScoreIcon label="Lighting Quality" score={imageQualityAssessment.lightingQualityScore} icon={Lightbulb} />
-                            <QualityScoreIcon label="Focus/Sharpness" score={imageQualityAssessment.focusSharpnessScore} icon={Aperture} />
-                            <QualityScoreIcon label="Background" score={imageQualityAssessment.backgroundAppropriatenessScore} icon={ImageIcon} />
-                            <QualityScoreIcon label="Expression" score={imageQualityAssessment.expressionAppropriatenessScore} icon={Drama} />
-                            <QualityScoreIcon label="Framing/Ratio" score={imageQualityAssessment.headToBodyRatioScore} icon={Ratio} />
-                            <QualityScoreIcon label="Obstructions" score={imageQualityAssessment.obstructionScore} icon={UserX} lowIsGood={true} />
-                          </div>
-                          <div className="border-t pt-3 mt-3 text-center">
-                            <Label className="text-sm font-medium text-muted-foreground mb-1 block">Overall Suitability</Label>
-                            <QualityScoreIcon label="Overall Suitability" score={imageQualityAssessment.overallSuitabilityScore} icon={CheckCircle2} />
-                          </div>
-    
-                          {imageQualityAssessment.feedback.length > 0 && (
-                            <div className="mt-4 pt-3 border-t">
-                              <h4 className="text-sm font-semibold mb-1">AI Feedback:</h4>
-                              <ul className="list-disc pl-5 space-y-1 text-xs text-muted-foreground">
-                                {imageQualityAssessment.feedback.map((item, index) => (
-                                  <li key={index}>{item}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )} 
 
-                        </>)
-                      )}
+                    </>)
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Enhancement Controls Panel */}
+              <Card className="flex-shrink-0">
+                <CardHeader>
+                  <CardTitle className="text-xl">Enhancement Controls</CardTitle>
+                </CardHeader>
+                {isClient && (
+                  <>
+                    <CardContent className="space-y-4">
+                      {(Object.keys(initialEnhancements) as Array<keyof EnhancementValues>).map((key) => (
+                        <div key={key} className="space-y-2">
+                          <div className="flex justify-between items-center">
+                            <Label htmlFor={key} className="capitalize font-medium flex items-center text-sm">
+                              {key.replace(/([A-Z])/g, ' $1').replace('Background B', 'Bg B')}
+                              <RationaleTooltip rationale={suggestionRationale?.[key]} />
+                            </Label>
+                            <span className="text-sm font-medium text-primary w-10 text-right">{enhancementValues[key].toFixed(2)}</span>
+                          </div>
+                          <Slider
+                            id={key}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            value={[enhancementValues[key]]}
+                            onValueChange={(val) => handleSliderChange(key, val)}
+                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
+                            aria-label={`${key} slider`}
+                            className="[&>span:last-child]:transition-transform [&>span:last-child]:duration-100 [&>span:last-child]:ease-linear h-2"
+                          />
+                        </div>
+                      ))}
                     </CardContent>
-                  </Card>
-    
+                    <CardFooter className="flex flex-col gap-3 pt-4">
+                      <Button
+                        onClick={handleSuggestEnhancements}
+                        disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
+                        className="w-full"
+                      >
+                        <WandSparkles className="mr-2 h-4 w-4" /> Suggest & Animate (AI)
+                        {isLoadingAI && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-foreground ml-2"></div>}
+                      </Button>
+                      <Button
+                        onClick={handleApplyEnhancements}
+                        disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
+                        className="w-full bg-accent hover:bg-accent/90 text-accent-foreground"
+                      >
+                        Apply AI & See Journey
+                        {isProcessingEnhancement && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent-foreground ml-2"></div>}
+                      </Button>
+                    </CardFooter>
+                  </>
+                )}
+              </Card>
+
+              {enhancementJourney && carouselSlides[currentSlide]?.id === 'ai-enhanced' && !isProcessingEnhancement && (
                   <Card className="flex-shrink-0">
-                    <CardHeader>
-                      <CardTitle className="text-xl">Enhancement Controls</CardTitle>
-                    </CardHeader>
-                    {isClient && (
-                      <>
-                        <CardContent className="space-y-4">
-                          {(Object.keys(initialEnhancements) as Array<keyof EnhancementValues>).map((key) => (
-                            <div key={key} className="space-y-2">
-                              <div className="flex justify-between items-center">
-                                <Label htmlFor={key} className="capitalize font-medium flex items-center text-sm">
-                                  {key.replace(/([A-Z])/g, ' $1').replace('Background B', 'Bg B')}
-                                  <RationaleTooltip rationale={suggestionRationale?.[key]} />
-                                </Label>
-                                <span className="text-sm font-medium text-primary w-10 text-right">{enhancementValues[key].toFixed(2)}</span>
-                              </div>
-                              <Slider
-                                id={key}
-                                min={0}
-                                max={1}
-                                step={0.01}
-                                value={[enhancementValues[key]]}
-                                onValueChange={(val) => handleSliderChange(key, val)}
-                                disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
-                                aria-label={`${key} slider`}
-                                className="[&>span:last-child]:transition-transform [&>span:last-child]:duration-100 [&>span:last-child]:ease-linear h-2"
-                              />
-                            </div>
-                          ))}
-                        </CardContent>
-                        <CardFooter className="flex flex-col gap-3 pt-4">
-                          <Button
-                            onClick={handleSuggestEnhancements}
-                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
-                            className="w-full"
-                          >
-                            <WandSparkles className="mr-2 h-4 w-4" /> Suggest &amp; Animate (AI)
-                            {isLoadingAI && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-foreground ml-2"></div>}
-                          </Button>
-                          <Button
-                            onClick={handleApplyEnhancements}
-                            disabled={!originalImage || isLoadingAI || isProcessingEnhancement || isAssessingQuality || isUploading}
-                            className="w-full bg-accent hover:bg-accent/90 text-accent-foreground"
-                          >
-                            Apply AI &amp; See Journey
-                            {isProcessingEnhancement && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent-foreground ml-2"></div>}
-                          </Button>
-                        </CardFooter>
-                      </>
-                    )}
-                  </Card>
-    
-                  {enhancementJourney && carouselSlides[currentSlide]?.id === 'ai-enhanced' && !isProcessingEnhancement && (
-                      <Card className="flex-shrink-0">
-                         <CardHeader><CardTitle className="text-xl">Enhancement Journey</CardTitle></CardHeader>
-                         <CardContent>
-                           <ul className="list-decimal pl-5 space-y-2 text-sm">
-                             {enhancementJourney.enhancementSteps.length > 0 ? (
-                                enhancementJourney.enhancementSteps.map((step, index) => (
-                                  <li key={index}>{step}</li>
-                                ))
-                             ) : (
-                                <li className="text-muted-foreground italic">No significant changes described by AI.</li>
-                             )
-                              }
-                            </ul>
-                          </CardContent>
-                        </Card>
-                      )}
-                  </div>
-            </>
+                     <CardHeader><CardTitle className="text-xl">Enhancement Journey</CardTitle></CardHeader>
+                     <CardContent>
+                       <ul className="list-decimal pl-5 space-y-2 text-sm">
+                         {enhancementJourney.enhancementSteps.length > 0 ? (
+                            enhancementJourney.enhancementSteps.map((step, index) => (
+                              <li key={index}>{step}</li>
+                            ))
+                         ) : (
+                            <li className="text-muted-foreground italic">No significant changes described by AI.</li>
+                         )
+                          }
+                        </ul>
+                      </CardContent>
+                    </Card>
+                  )}
+              </div>
+          </>
         )}
       </main>
 
       <footer className="bg-card border-t mt-auto flex-shrink-0">
         <div className="container mx-auto px-4 py-3 text-center text-muted-foreground text-xs">
-          &copy; {new Date().getFullYear()} Headshot Handcrafter. All rights reserved.
+          © {new Date().getFullYear()} Headshot Handcrafter. All rights reserved.
         </div>
       </footer>
     </div>

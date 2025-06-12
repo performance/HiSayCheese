@@ -1,9 +1,14 @@
 import uuid # Added for path parameters
-from fastapi import APIRouter, Depends, HTTPException, status, Response, Request # Added Request
+import os # Added for os.path.splitext
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, UploadFile, File # Added Request, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List, Optional # Optional might be needed for response models if applicable
 
-from models.models import User, UserSchema, EnhancementHistorySchema, PresetCreate, PresetSchema, PresetUpdate # Added Preset schemas
+from models.models import User
+from schemas.history_schemas import EnhancementHistorySchema
+from schemas.user_schemas import UserSchema
+from schemas.preset_schemas import PresetCreate, PresetSchema, PresetUpdate
+from services.storage_service import StorageService # Added StorageService
 from auth_utils import get_current_user
 from db import crud
 from db.database import get_db # Added get_db
@@ -117,3 +122,35 @@ async def delete_preset(
     if deleted_preset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preset not found or not owned by user")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/upload-image")
+async def upload_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    storage_service: StorageService = Depends(StorageService)
+):
+    """
+    Upload an image for the current authenticated user.
+    """
+    # Generate a unique object key
+    object_key = f"uploads/{current_user.id}/{uuid.uuid4()}{os.path.splitext(file.filename)[1]}"
+
+    try:
+        # Upload the file
+        storage_service.upload_file(
+            file_obj=file.file,
+            object_key=object_key,
+            content_type=file.content_type
+        )
+
+        # Return the object key and other file details
+        return {
+            "object_key": object_key,
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "file_url": storage_service.get_public_url(object_key)  # Assuming public URL for simplicity
+        }
+    except Exception as e:
+        # Basic error handling
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

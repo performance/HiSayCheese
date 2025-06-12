@@ -13,6 +13,7 @@ import time
 import logging
 from pythonjsonlogger import jsonlogger
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.staticfiles import StaticFiles
@@ -200,11 +201,7 @@ class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
         
         request.scope['receive'] = new_receive
         return await call_next(request)
-# backend/main.py
 
-# ... (other imports)
-
-# This middleware is what needs to be fixed.
 class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next: RequestResponseCall) -> StarletteResponse:
         response = await call_next(request)
@@ -275,7 +272,30 @@ async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExc
 
 # --- FastAPI Application Setup ---
 
+# --- Application Events ---
+
+# @app.on_event("startup")
+# def on_startup():
+#     logger.info("Application starting up...")
+#     create_db_and_tables()
+#     logger.info("Database tables checked/created.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Code to run on startup
+    logger.info("Application starting up...")
+    create_db_and_tables()
+    logger.info("Database tables checked/created.")
+    print("Database tables checked/created.")
+    yield
+    # Code to run on shutdown
+    print("Application shutting down.")
+
+
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Image Enhancement API",
     description="An API for uploading, analyzing, and enhancing portrait images.",
     version="1.0.0"
@@ -307,14 +327,6 @@ app.add_middleware(SecurityHeadersMiddleware)
 # app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)
 app.add_middleware(RateLimitHeaderMiddleware)
 
-
-# --- Application Events ---
-
-@app.on_event("startup")
-def on_startup():
-    logger.info("Application starting up...")
-    create_db_and_tables()
-    logger.info("Database tables checked/created.")
 
 
 # --- Include Routers ---

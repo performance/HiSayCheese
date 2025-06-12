@@ -164,7 +164,7 @@ async def upload_image(
     presigned_url = storage.generate_presigned_url(db_image.filepath)
 
     # Manually construct the response to include the presigned_url, as it's not part of the DB model
-    response_data = image_schemas.ImageSchema.from_orm(db_image).model_dump()
+    response_data = image_schemas.ImageSchema.model_validate(db_image).model_dump()
     response_data['presigned_url'] = presigned_url
     
     return response_data

@@ -17,16 +17,16 @@ from config import FRONTEND_URL
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
 
-# Instantiate EmailService globally
-try:
-    email_service = EmailService()
-    logger.info("EmailService initialized successfully in auth_router.")
-except HTTPException as e:
-    logger.error(f"Auth Router: Failed to initialize EmailService (HTTPException): {e.detail}")
-    email_service = None
-except Exception as e:
-    logger.error(f"Auth Router: Failed to initialize EmailService (General Exception): {e}", exc_info=True)
-    email_service = None # Corrected variable name
+# EmailService will be injected as a dependency
+# try:
+#     email_service = EmailService()
+#     logger.info("EmailService initialized successfully in auth_router.")
+# except HTTPException as e:
+#     logger.error(f"Auth Router: Failed to initialize EmailService (HTTPException): {e.detail}")
+#     email_service = None
+# except Exception as e:
+#     logger.error(f"Auth Router: Failed to initialize EmailService (General Exception): {e}", exc_info=True)
+#     email_service = None # Corrected variable name
 
 router = APIRouter(
     prefix="/api/auth",
@@ -40,7 +40,8 @@ def register_user(
     request: Request,
     user: UserCreate,
     background_tasks: BackgroundTasks, # Added BackgroundTasks
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    email_service: EmailService = Depends(EmailService) # Injected EmailService
 ):
     # Password strength (including length) is now handled by Pydantic model UserCreate
 

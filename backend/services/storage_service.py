@@ -5,32 +5,33 @@ from botocore.exceptions import ClientError, NoCredentialsError, PartialCredenti
 from fastapi import HTTPException, status
 from typing import Optional # Added Optional for type hints
 
-# Import configurations from config.py
-try:
-    from config import AWS_S3_BUCKET_NAME, AWS_S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-except ImportError:
-    # This is a fallback for cases where config.py might not be structured as expected
-    # or for simpler testing environments. Production should rely on environment variables.
-    AWS_S3_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME", "your-s3-bucket-name-fallback")
-    AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "us-east-1")
-    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID") # No default for credentials
-    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY") # No default for credentials
+# Config values will be fetched from os.environ directly in __init__
+# try:
+#     from config import AWS_S3_BUCKET_NAME, AWS_S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# except ImportError:
+#     AWS_S3_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME", "your-s3-bucket-name-fallback")
+#     AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "us-east-1")
+#     AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID") # No default for credentials
+#     AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY") # No default for credentials
 
 logger = logging.getLogger(__name__)
 
 class StorageService:
     def __init__(self):
-        self.bucket_name = AWS_S3_BUCKET_NAME
-        self.region = AWS_S3_REGION
+        # Fetch configuration directly from environment variables at instantiation time
+        self.bucket_name = os.environ.get("AWS_S3_BUCKET_NAME", "your-s3-bucket-name-fallback-init")
+        self.region = os.environ.get("AWS_S3_REGION", "us-east-1")
+        _aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+        _aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
         # Initialize S3 client
-        # If AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are None, boto3 will try to find credentials
+        # If _aws_access_key_id and _aws_secret_access_key are None, boto3 will try to find credentials
         # through other methods (e.g., IAM roles, shared credentials file).
         try:
             self.s3_client = boto3.client(
                 "s3",
-                aws_access_key_id=AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                aws_access_key_id=_aws_access_key_id,
+                aws_secret_access_key=_aws_secret_access_key,
                 region_name=self.region
             )
             # Verify connection or credentials by making a simple call, e.g., head_bucket

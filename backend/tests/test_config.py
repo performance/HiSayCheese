@@ -78,6 +78,8 @@ def test_config_loading_failure_placeholder_secret_key():
     # SECRET_KEY is deliberately not set in os.environ for this test.
     # config.py will assign its placeholder default: "your-super-secret-key-please-change-in-production"
 
+    os.environ["MODE"] = "production" # Ensure validation runs
+
     with pytest.raises(ValueError, match=r"SECRET_KEY .*is set to a default placeholder value.*and must be changed"):
         import config
         importlib.reload(config) # Reload to trigger definitions and validation
@@ -91,6 +93,8 @@ def test_config_loading_failure_placeholder_aws_s3_bucket_name():
             os.environ[key] = value
 
     # AWS_S3_BUCKET_NAME will use its placeholder "your-s3-bucket-name"
+    os.environ["MODE"] = "production" # Ensure validation runs
+
     with pytest.raises(ValueError, match=r"AWS_S3_BUCKET_NAME .*is set to a default placeholder value.*and must be changed"):
         import config
         importlib.reload(config)
@@ -102,6 +106,8 @@ def test_config_loading_failure_placeholder_aws_access_key_id():
     for key, value in MINIMAL_REQUIRED_CONFIG_FOR_TEST_NON_PLACEHOLDER.items():
         if key != "AWS_ACCESS_KEY_ID":
             os.environ[key] = value
+
+    os.environ["MODE"] = "production" # Ensure validation runs
 
     with pytest.raises(ValueError, match=r"AWS_ACCESS_KEY_ID .*is set to a default placeholder value.*and must be changed"):
         import config
@@ -115,6 +121,8 @@ def test_config_loading_failure_placeholder_aws_secret_access_key():
         if key != "AWS_SECRET_ACCESS_KEY":
             os.environ[key] = value
 
+    os.environ["MODE"] = "production" # Ensure validation runs
+
     with pytest.raises(ValueError, match=r"AWS_SECRET_ACCESS_KEY .*is set to a default placeholder value.*and must be changed"):
         import config
         importlib.reload(config)
@@ -126,6 +134,8 @@ def test_config_loading_failure_placeholder_aws_ses_sender_email():
     for key, value in MINIMAL_REQUIRED_CONFIG_FOR_TEST_NON_PLACEHOLDER.items():
         if key != "AWS_SES_SENDER_EMAIL":
             os.environ[key] = value
+
+    os.environ["MODE"] = "production" # Ensure validation runs
 
     with pytest.raises(ValueError, match=r"AWS_SES_SENDER_EMAIL .*is set to a default placeholder value.*and must be changed"):
         import config

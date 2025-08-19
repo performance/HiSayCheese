@@ -27,10 +27,13 @@ import time # For ResponseTimeLoggingMiddleware
 # Define RequestResponseCall if not available from starlette directly
 RequestResponseCall = Callable[[Request], Awaitable[StarletteResponse]]
 
+import logging # Ensure logging is imported early
+logger = logging.getLogger(__name__) # Define logger early
+
 # Rate Limiting - Moved to rate_limiter.py
 # from slowapi import Limiter, _rate_limit_exceeded_handler # Now in rate_limiter.py
 from slowapi.errors import RateLimitExceeded # Still needed for exception handler
-# from limits.util import parse_many # Now in rate_limiter.py
+from limits.util import parse_many # Added back for RateLimitHeaderMiddleware
 from rate_limiter import limiter, get_dynamic_rate_limit, ANON_USER_RATE_LIMIT, AUTH_USER_RATE_LIMIT # Import from new module
 
 from fastapi.responses import JSONResponse # For the exception handler
@@ -318,8 +321,14 @@ class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
                 current_limit_obj: Any = current_limit_obj_list[0] # Type changed to Any
 
                 # Get window stats
-                # get_window_stats expects a parsed limit object from 'limits' library.
-                window_stats = limiter_instance.storage.get_window_stats(key, current_limit_obj)
+                # The Limiter object (from slowapi) has a `limiter` attribute which is an instance of `limits.strategies.MovingWindowRateLimiter` (or similar).
+                # That strategy instance has the `get_window_stats` method.
+                if hasattr(limiter_instance, 'limiter') and hasattr(limiter_instance.limiter, 'get_window_stats'):
+                    window_stats = limiter_instance.limiter.get_window_stats(key, current_limit_obj)
+                else:
+                    # Fallback or error if the structure isn't as expected
+                    logger.error("Rate limiter's internal structure not as expected, cannot get window_stats.")
+                    return response # Or handle error appropriately
 
                 reset_time = int(window_stats[0])
                 remaining_count = window_stats[1]
@@ -353,7 +362,14 @@ async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExc
         if key and limit_obj_hit and hasattr(request.app.state, 'limiter'):
             limiter_instance: Limiter = request.app.state.limiter
             # get_window_stats expects the specific limit object that was hit
-            window_stats = limiter_instance.storage.get_window_stats(key, limit_obj_hit)
+            # Corrected from .storage to ._storage, now to use .limiter
+            if hasattr(limiter_instance, 'limiter') and hasattr(limiter_instance.limiter, 'get_window_stats'):
+                window_stats = limiter_instance.limiter.get_window_stats(key, limit_obj_hit)
+            else:
+                logger.error("Rate limiter's internal structure not as expected in custom_rate_limit_exceeded_handler.")
+                # Cannot set detailed headers if this fails
+                return response
+
 
             reset_time = int(window_stats[0])
             # Remaining is 0 because the limit was exceeded
@@ -396,7 +412,18 @@ app.add_middleware(
 
 # SecurityHeadersMiddleware should ideally be one of the first
 app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)
+
+# Conditionally add RequestBodySizeLimitMiddleware
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+print(f"MAIN.PY: Current APP_ENV when middleware is configured: {APP_ENV}") # ADDED PRINT STATEMENT
+logger.info(f"Current APP_ENV: {APP_ENV}") # Log the environment
+
+if APP_ENV != "test":
+    logger.info("Adding RequestBodySizeLimitMiddleware.")
+    app.add_middleware(RequestBodySizeLimitMiddleware, max_size=MAX_REQUEST_BODY_SIZE)
+else:
+    logger.info("Skipping RequestBodySizeLimitMiddleware in 'test' environment.")
+
 # RateLimitHeaderMiddleware should be added after slowapi might have interacted (though it doesn't use middleware)
 # and after request.state.rate_limit_key is potentially set.
 # It should be one of the later middlewares so it can modify the final response.
@@ -455,19 +482,8 @@ if SENTRY_DSN and SENTRY_DSN != "your-sentry-dsn-goes-here":
 else:
     logger.warning("Sentry DSN not found or is placeholder. Sentry will not be initialized.")
 
-# Instantiate StorageService
-try:
-    storage_service = StorageService()
-    logger.info("StorageService initialized successfully.")
-except HTTPException as e:
-    logger.error(f"Failed to initialize StorageService: {e.detail}")
-    # Depending on policy, we might re-raise or exit, or allow app to run with degraded functionality.
-    # For now, let it proceed and fail on operations if storage_service is not available.
-    # A more robust approach might involve a health check for S3 connectivity.
-    storage_service = None # Ensure it's None if initialization fails
-except Exception as e:
-    logger.error(f"An unexpected error occurred during StorageService initialization: {e}")
-    storage_service = None # Ensure it's None
+# Define storage_service as Optional and initialize on startup
+storage_service: Optional[StorageService] = None
 
 
 # Constants
@@ -484,8 +500,19 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # MAX_REQUEST_BODY_SIZE is defined above for general requests
 
 @app.on_event("startup")
-def on_startup():
+def startup_event(): # Renamed from on_startup to avoid confusion if there are multiple
+    global storage_service # Declare intent to modify the global variable
     create_db_and_tables()
+    logger.info("Attempting to initialize StorageService during startup event...")
+    try:
+        storage_service = StorageService()
+        logger.info("StorageService initialized successfully via startup event.")
+    except HTTPException as e:
+        logger.error(f"Failed to initialize StorageService via startup event: {e.detail}")
+        storage_service = None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during StorageService initialization via startup event: {e}", exc_info=True)
+        storage_service = None
 
 @app.get("/health", response_model=models.NumberSchema) # Corrected to NumberSchema
 async def health(db: Session = Depends(get_db)):

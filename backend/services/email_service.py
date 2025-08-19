@@ -5,28 +5,31 @@ from botocore.exceptions import ClientError, NoCredentialsError, PartialCredenti
 from fastapi import HTTPException, status
 from typing import List, Optional
 
-# Import configurations from config.py
-try:
-    from config import AWS_SES_REGION, AWS_SES_SENDER_EMAIL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-except ImportError:
-    # Fallback for simpler testing or if config structure changes
-    AWS_SES_REGION = os.environ.get("AWS_SES_REGION", "us-east-1")
-    AWS_SES_SENDER_EMAIL = os.environ.get("AWS_SES_SENDER_EMAIL", "sender@example.com")
-    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
-    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+# Configuration will be fetched from os.environ directly in __init__
+# try:
+#     from config import AWS_SES_REGION, AWS_SES_SENDER_EMAIL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# except ImportError:
+#     # Fallback for simpler testing or if config structure changes
+#     AWS_SES_REGION = os.environ.get("AWS_SES_REGION", "us-east-1")
+#     AWS_SES_SENDER_EMAIL = os.environ.get("AWS_SES_SENDER_EMAIL", "sender@example.com")
+#     AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+#     AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
 logger = logging.getLogger(__name__)
 
 class EmailService:
     def __init__(self):
-        self.region = AWS_SES_REGION
-        self.sender_email = AWS_SES_SENDER_EMAIL
+        # Fetch configuration directly from environment variables at instantiation time
+        self.region = os.environ.get("AWS_SES_REGION", "us-east-1") # Default from config.py
+        self.sender_email = os.environ.get("AWS_SES_SENDER_EMAIL", "sender@example.com") # Default from config.py
+        _aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID") # No default, rely on env or mock
+        _aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY") # No default, rely on env or mock
 
         try:
             self.ses_client = boto3.client(
                 "ses",
-                aws_access_key_id=AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                aws_access_key_id=_aws_access_key_id,
+                aws_secret_access_key=_aws_secret_access_key,
                 region_name=self.region
             )
             # Verify SES setup by checking if the sender email is verified.
